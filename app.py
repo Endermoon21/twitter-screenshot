@@ -80,10 +80,13 @@ async def capture_tweet_async(url, parsed, theme="dark", hide_metrics=False, wid
                     tweet.style.minWidth = targetWidth + 'px';
 
                     // Also force width on parent containers that might constrain it
+                    // and remove column borders that appear in screenshots
                     let parent = tweet.parentElement;
-                    for (let i = 0; i < 5 && parent; i++) {
+                    for (let i = 0; i < 10 && parent; i++) {
                         parent.style.width = targetWidth + 'px';
                         parent.style.maxWidth = targetWidth + 'px';
+                        parent.style.borderLeft = 'none';
+                        parent.style.borderRight = 'none';
                         parent = parent.parentElement;
                     }
                 }
