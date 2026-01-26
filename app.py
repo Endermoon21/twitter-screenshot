@@ -43,22 +43,22 @@ async def capture_tweet_async(url, parsed, theme="dark", hide_metrics=False, wid
                 await page.wait_for_selector(tweet_selector, timeout=5000)
             await page.wait_for_timeout(2000)
 
-            # Expand Show more links
-            show_more_selectors = [
-                "[data-testid=\"tweet-text-show-more-link\"]",
-                "article [role=\"link\"]:has-text(\"Show more\")",
-            ]
-            for selector in show_more_selectors:
-                try:
-                    buttons = await page.query_selector_all(selector)
-                    for btn in buttons:
-                        try:
+            # Expand Show more links - but ONLY ones without href (navigation links)
+            # Quote tweets have "Show more" links with href that navigate away!
+            try:
+                show_more_buttons = await page.query_selector_all("[data-testid=\"tweet-text-show-more-link\"]")
+                for btn in show_more_buttons:
+                    try:
+                        href = await btn.get_attribute("href")
+                        # Only click if NO href - those expand text in place
+                        # Skip if has href - those navigate to another tweet
+                        if not href:
                             await btn.click()
                             await page.wait_for_timeout(500)
-                        except:
-                            pass
-                except:
-                    pass
+                    except:
+                        pass
+            except:
+                pass
             await page.wait_for_timeout(500)
 
             if hide_metrics:
