@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Twitter Screenshot App - Simple Syndication Embed Approach
-- Uses Twitter's public embed/syndication API (no login required)
-- Simpler architecture without complex threading
+Twitter Screenshot App with Authentication
+- Uses nodriver (undetected Chrome) for anti-bot bypass
+- Supports Twitter login via exported cookies
+- Batch queue with real-time SSE progress
+- ZIP download support
 """
 
 import asyncio
@@ -18,6 +20,7 @@ import zipfile
 from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 
 from flask import (Flask, Response, jsonify, make_response, render_template,
                    request, send_file, stream_with_context)
@@ -40,7 +43,11 @@ logger = logging.getLogger('twitter-screenshot')
 
 CHROME_PATH = '/root/.cache/ms-playwright/chromium-1200/chrome-linux64/chrome'
 SAVE_DIR = "/tmp/twitter_screenshots"
+CONFIG_DIR = "/opt/twitter-screenshot/config"
+AUTH_FILE = os.path.join(CONFIG_DIR, "auth.json")
+
 os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
 MAX_QUEUE_SIZE = 50
 MAX_SCREENSHOT_AGE = 3600
@@ -67,6 +74,60 @@ queue_events = []
 EVENTS_LOCK = threading.Lock()
 MESSAGE_COUNTER = 0
 
+# =============================================================================
+# Auth Functions
+# =============================================================================
+
+def load_auth():
+    """Load authentication data from config file"""
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load auth: {e}")
+    return None
+
+
+def save_auth(auth_data):
+    """Save authentication data to config file"""
+    try:
+        with open(AUTH_FILE, 'w') as f:
+            json.dump(auth_data, f, indent=2)
+        logger.info("Auth saved successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save auth: {e}")
+        return False
+
+
+def clear_auth():
+    """Clear authentication data"""
+    if os.path.exists(AUTH_FILE):
+        os.remove(AUTH_FILE)
+        logger.info("Auth cleared")
+
+
+def get_auth_status():
+    """Get current authentication status"""
+    auth = load_auth()
+    if not auth:
+        return {"authenticated": False}
+
+    # Check if we have the essential cookies
+    cookies = auth.get("cookies", [])
+    has_auth_token = any(c.get("name") == "auth_token" for c in cookies)
+    has_ct0 = any(c.get("name") == "ct0" for c in cookies)
+
+    return {
+        "authenticated": has_auth_token or has_ct0,
+        "cookie_count": len(cookies),
+        "timestamp": auth.get("timestamp"),
+    }
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
 
 def generate_queue_id():
     return uuid.uuid4().hex[:8]
@@ -131,60 +192,93 @@ def broadcast_queue_update():
             except:
                 pass
 
-
 # =============================================================================
 # Capture Functions
 # =============================================================================
 
-async def capture_tweet_async(tweet_id: str, username: str, theme: str = "dark",
-                              hide_metrics: bool = False, width: int = 550) -> dict:
-    """Capture tweet using syndication embed (no login required)"""
+async def capture_tweet_nodriver(url, parsed, theme="dark", hide_metrics=False, width=550):
+    """Capture tweet using nodriver with authentication"""
     browser = None
     try:
+        # Load auth data
+        auth = load_auth()
+
         # Start browser
         browser = await uc.start(
-            headless=False,
+            headless=False,  # Xvfb provides display
             browser_executable_path=CHROME_PATH,
             browser_args=[
+                f'--window-size={width},1200',
+                '--disable-gpu',
                 '--no-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-software-rasterizer',
                 '--force-device-scale-factor=2',
-                f'--window-size={width},1200',
             ]
         )
 
-        # Use syndication embed URL
-        embed_url = f"https://platform.twitter.com/embed/Tweet.html?dnt=false&id={tweet_id}&theme={theme}"
-        logger.info(f"Loading: {embed_url}")
+        # If we have auth, set cookies first
+        if auth and auth.get("cookies"):
+            logger.info("Applying saved cookies...")
 
-        page = await browser.get(embed_url)
-
-        # Wait for content to load
-        for i in range(15):
+            # Navigate to Twitter first to set cookies on the domain
+            page = await browser.get("https://x.com")
             await page.sleep(1)
-            has_content = await page.evaluate('''() => {
-                const article = document.querySelector('article');
-                const tweetText = document.querySelector('[data-testid="tweetText"]');
-                return !!(article || tweetText);
-            }''')
-            if has_content:
-                logger.info(f"Content loaded after {i+1}s")
-                break
 
-        # Check for errors
+            # Set cookies
+            for cookie in auth["cookies"]:
+                try:
+                    await browser.cookies.set(
+                        name=cookie["name"],
+                        value=cookie["value"],
+                        domain=cookie.get("domain", ".x.com"),
+                        path=cookie.get("path", "/"),
+                        secure=cookie.get("secure", True),
+                        http_only=cookie.get("httpOnly", False),
+                    )
+                except Exception as e:
+                    logger.debug(f"Cookie set error: {e}")
+
+            logger.info(f"Set {len(auth['cookies'])} cookies")
+
+        # Navigate to tweet
+        logger.info(f"Loading tweet: {url}")
+        page = await browser.get(url)
+
+        # Wait for page to load
+        await page.sleep(3)
+
+        # Check if we hit the login wall
         body_text = await page.evaluate('document.body.innerText')
-        if "doesn't exist" in body_text or "This post is from" in body_text:
-            await browser.stop()
-            return {"success": False, "error": f"Tweet not available"}
 
-        # Hide metrics if requested
-        if hide_metrics:
-            await page.evaluate('''() => {
-                const row = document.querySelector('[role="group"]');
-                if (row) row.style.display = 'none';
-            }''')
+        if "Log in" in body_text and "Sign up" in body_text:
+            # Try refreshing with cookies applied
+            logger.warning("Login wall detected, retrying...")
+            await page.sleep(1)
+            page = await browser.get(url)
+            await page.sleep(3)
+            body_text = await page.evaluate('document.body.innerText')
+
+        if "Log in to X" in body_text or ("Log in" in body_text and "Sign up" in body_text and "article" not in await page.evaluate('document.body.innerHTML')):
+            logger.error("Login wall still present - auth may be expired")
+            await browser.stop()
+            return {"success": False, "error": "Login required - please update your authentication"}
+
+        # Try to find tweet element
+        tweet_found = False
+        for i in range(10):
+            try:
+                has_article = await page.evaluate('!!document.querySelector("article")')
+                if has_article:
+                    tweet_found = True
+                    logger.info(f"Tweet found after {i+1}s")
+                    break
+            except:
+                pass
+            await page.sleep(1)
+
+        if not tweet_found:
+            await browser.stop()
+            return {"success": False, "error": "Could not find tweet - it may not exist or be private"}
 
         # Wait for images to load
         await page.evaluate('''() => {
@@ -198,83 +292,116 @@ async def capture_tweet_async(tweet_id: str, username: str, theme: str = "dark",
                     if (img.complete) checkDone();
                     else { img.onload = checkDone; img.onerror = checkDone; }
                 });
-                setTimeout(resolve, 3000); // Max 3s wait for images
+                setTimeout(resolve, 5000);
             });
         }''')
 
-        await page.sleep(0.3)
+        # Apply theme
+        if theme == "light":
+            await page.evaluate('''() => {
+                document.documentElement.style.colorScheme = 'light';
+            }''')
+        else:
+            await page.evaluate('''() => {
+                document.documentElement.style.colorScheme = 'dark';
+            }''')
 
-        # Get the tweet container bounds and crop to just the tweet
-        bounds = await page.evaluate('''() => {
-            // Find the main tweet container - it's usually the first twitter-tweet or article
-            const container = document.querySelector('.twitter-tweet') ||
-                             document.querySelector('twitter-widget') ||
-                             document.querySelector('article') ||
-                             document.querySelector('[data-tweet-id]');
+        # Hide metrics if requested
+        if hide_metrics:
+            await page.evaluate('''() => {
+                document.querySelectorAll('[data-testid="like"], [data-testid="retweet"], [data-testid="reply"]')
+                    .forEach(el => {
+                        const parent = el.closest('[role="group"]');
+                        if (parent) parent.style.display = 'none';
+                    });
+            }''')
 
-            if (!container) {
-                // Fallback: find the content wrapper
-                const body = document.body;
-                const firstChild = body.firstElementChild;
-                if (firstChild) {
-                    const rect = firstChild.getBoundingClientRect();
-                    return { x: 0, y: 0, width: rect.width, height: rect.height + 20 };
+        # Remove UI clutter for cleaner screenshot
+        await page.evaluate('''() => {
+            // Remove bottom bar
+            document.querySelector('[data-testid="BottomBar"]')?.remove();
+
+            // Remove dialogs/modals
+            document.querySelectorAll('[role="dialog"]').forEach(e => e.remove());
+
+            // Remove sidebar
+            document.querySelector('[data-testid="sidebarColumn"]')?.remove();
+
+            // Remove header
+            document.querySelector('header[role="banner"]')?.remove();
+
+            // Remove "What's happening" and other sidebars
+            document.querySelectorAll('[aria-label="Timeline: Trending now"]').forEach(e => e.remove());
+
+            // Remove login prompts
+            document.querySelectorAll('[data-testid="sheetDialog"]').forEach(e => e.remove());
+
+            // Hide the "More Tweets" section
+            const articles = document.querySelectorAll('article');
+            if (articles.length > 1) {
+                // Keep only the first article (the main tweet)
+                for (let i = 1; i < articles.length; i++) {
+                    articles[i].style.display = 'none';
                 }
-                return null;
             }
+        }''')
 
-            const rect = container.getBoundingClientRect();
-            return {
-                x: Math.max(0, rect.x),
-                y: Math.max(0, rect.y),
-                width: rect.width,
-                height: rect.height + 10  // Small padding
-            };
+        await page.sleep(0.5)
+
+        # Get tweet bounds for cropping
+        bounds = await page.evaluate('''() => {
+            const article = document.querySelector('article');
+            if (article) {
+                const rect = article.getBoundingClientRect();
+                return {
+                    x: Math.max(0, rect.x - 10),
+                    y: Math.max(0, rect.y - 10),
+                    width: rect.width + 20,
+                    height: rect.height + 20
+                };
+            }
+            return null;
         }''')
 
         # Take screenshot
-        screenshot_path = f"/tmp/tweet_{tweet_id}_{int(time.time())}.png"
+        screenshot_path = f"/tmp/tweet_{parsed['tweet_id']}_{int(time.time())}.png"
+        await page.save_screenshot(screenshot_path)
 
-        if bounds and bounds.get('height', 0) > 50:
-            # Use CDP to capture just the tweet area
-            logger.info(f"Cropping to bounds: {bounds}")
+        # Crop to tweet if we got bounds
+        if bounds and bounds.get('height', 0) > 100:
+            try:
+                from PIL import Image
+                img = Image.open(screenshot_path)
 
-            # Take full screenshot first, then we'll crop
-            await page.save_screenshot(screenshot_path)
+                scale = 2  # device scale factor
+                crop_box = (
+                    int(bounds['x'] * scale),
+                    int(bounds['y'] * scale),
+                    int((bounds['x'] + bounds['width']) * scale),
+                    int((bounds['y'] + bounds['height']) * scale)
+                )
 
-            # Crop the image using PIL
-            from PIL import Image
-            img = Image.open(screenshot_path)
+                # Ensure within bounds
+                crop_box = (
+                    max(0, crop_box[0]),
+                    max(0, crop_box[1]),
+                    min(img.width, crop_box[2]),
+                    min(img.height, crop_box[3])
+                )
 
-            # Scale bounds by device pixel ratio (2x)
-            scale = 2
-            crop_box = (
-                int(bounds['x'] * scale),
-                int(bounds['y'] * scale),
-                int((bounds['x'] + bounds['width']) * scale),
-                int((bounds['y'] + bounds['height']) * scale)
-            )
+                if crop_box[2] > crop_box[0] and crop_box[3] > crop_box[1]:
+                    cropped = img.crop(crop_box)
+                    cropped.save(screenshot_path)
+                    logger.info(f"Cropped from {img.size} to {cropped.size}")
+            except Exception as e:
+                logger.warning(f"Crop failed: {e}")
 
-            # Ensure crop box is within image bounds
-            crop_box = (
-                max(0, crop_box[0]),
-                max(0, crop_box[1]),
-                min(img.width, crop_box[2]),
-                min(img.height, crop_box[3])
-            )
-
-            cropped = img.crop(crop_box)
-            cropped.save(screenshot_path)
-            logger.info(f"Cropped from {img.size} to {cropped.size}")
-        else:
-            # Fallback to full screenshot
-            await page.save_screenshot(screenshot_path)
-
+        # Read screenshot bytes
         with open(screenshot_path, 'rb') as f:
             screenshot_bytes = f.read()
         os.remove(screenshot_path)
 
-        # Stop browser (don't await - may not be coroutine in all nodriver versions)
+        # Stop browser
         try:
             result = browser.stop()
             if asyncio.iscoroutine(result):
@@ -282,37 +409,35 @@ async def capture_tweet_async(tweet_id: str, username: str, theme: str = "dark",
         except:
             pass
 
-        logger.info(f"Captured tweet {tweet_id}")
+        logger.info(f"Captured tweet {parsed['tweet_id']}")
         return {
             "success": True,
             "bytes": screenshot_bytes,
-            "username": username,
-            "tweet_id": tweet_id
+            "username": parsed['username'],
+            "tweet_id": parsed['tweet_id']
         }
 
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Capture error: {e}")
         if browser:
             try:
-                browser.stop()  # Don't await - it may not be a coroutine
+                browser.stop()
             except:
                 pass
         return {"success": False, "error": str(e)}
 
 
-def capture_tweet_sync(tweet_id: str, username: str, theme: str = "dark",
-                       hide_metrics: bool = False, width: int = 550) -> dict:
-    """Synchronous wrapper"""
+def capture_tweet_sync(url, parsed, theme="dark", hide_metrics=False, width=550):
+    """Synchronous wrapper for async capture"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         result = loop.run_until_complete(
-            capture_tweet_async(tweet_id, username, theme, hide_metrics, width)
+            capture_tweet_nodriver(url, parsed, theme, hide_metrics, width)
         )
         return result
     finally:
         loop.close()
-
 
 # =============================================================================
 # Queue Worker
@@ -332,8 +457,8 @@ def queue_worker():
 
             try:
                 result = capture_tweet_sync(
-                    tweet_id=item['parsed']['tweet_id'],
-                    username=item['parsed']['username'],
+                    item['url'],
+                    item['parsed'],
                     theme=item.get('theme', 'dark'),
                     hide_metrics=item.get('hide_metrics', False),
                     width=item.get('width', 550)
@@ -387,7 +512,6 @@ def start_queue_worker():
     worker.start()
     logger.info("Queue worker started")
 
-
 # =============================================================================
 # Routes
 # =============================================================================
@@ -403,12 +527,40 @@ def index():
 
 @app.route("/api/health")
 def health():
+    auth_status = get_auth_status()
     return jsonify({
         "status": "healthy",
         "queue_size": work_queue.qsize(),
         "screenshots_stored": len(SCREENSHOT_STORAGE),
         "display": os.environ.get('DISPLAY', 'not set'),
+        "auth": auth_status,
     })
+
+
+@app.route("/api/auth/status")
+def auth_status():
+    return jsonify(get_auth_status())
+
+
+@app.route("/api/auth/save", methods=["POST"])
+def auth_save():
+    data = request.json
+    if not data:
+        return jsonify({"success": False, "error": "No data provided"}), 400
+
+    # Validate we have cookies
+    if not data.get("cookies"):
+        return jsonify({"success": False, "error": "No cookies in auth data"}), 400
+
+    if save_auth(data):
+        return jsonify({"success": True, "status": get_auth_status()})
+    return jsonify({"success": False, "error": "Failed to save auth"}), 500
+
+
+@app.route("/api/auth/clear", methods=["POST"])
+def auth_clear():
+    clear_auth()
+    return jsonify({"success": True})
 
 
 @app.route("/api/capture", methods=["POST"])
@@ -426,13 +578,7 @@ def capture():
     if not parsed:
         return jsonify({"success": False, "error": "Invalid tweet URL"})
 
-    result = capture_tweet_sync(
-        tweet_id=parsed['tweet_id'],
-        username=parsed['username'],
-        theme=theme,
-        hide_metrics=hide_metrics,
-        width=width
-    )
+    result = capture_tweet_sync(url, parsed, theme, hide_metrics, width)
 
     if result['success']:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -638,13 +784,136 @@ def serve_screenshot(filename):
     return jsonify({"error": "Not found"}), 404
 
 
+@app.route("/twitter_auth.py")
+def serve_auth_script():
+    """Serve the authentication script for download"""
+    auth_script = '''#!/usr/bin/env python3
+"""
+Twitter Authentication Script
+Run this locally to log into Twitter and export your session.
+Then paste the output into the web app.
+
+Usage:
+    python twitter_auth.py
+
+Requirements:
+    pip install nodriver
+"""
+
+import asyncio
+import json
+import os
+import sys
+
+try:
+    import nodriver as uc
+except ImportError:
+    print("ERROR: nodriver not installed")
+    print("Install with: pip install nodriver")
+    sys.exit(1)
+
+
+async def main():
+    print("=" * 60)
+    print("Twitter Authentication Script")
+    print("=" * 60)
+    print()
+    print("A browser window will open. Please:")
+    print("1. Log into your Twitter/X account")
+    print("2. Make sure you can see your timeline")
+    print("3. Come back here and press Enter")
+    print()
+    print("Starting browser...")
+
+    user_data_dir = os.path.expanduser("~/.twitter_screenshot_auth")
+    os.makedirs(user_data_dir, exist_ok=True)
+
+    browser = await uc.start(
+        headless=False,
+        user_data_dir=user_data_dir,
+    )
+
+    page = await browser.get("https://x.com/login")
+
+    print()
+    print("Browser opened. Please log into Twitter.")
+    print()
+    input("Press Enter after you've logged in and can see your timeline...")
+
+    cookies = await browser.cookies.get_all()
+
+    cookie_list = []
+    for cookie in cookies:
+        cookie_dict = {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": cookie.domain,
+            "path": cookie.path,
+            "secure": cookie.secure,
+            "httpOnly": cookie.http_only if hasattr(cookie, 'http_only') else False,
+        }
+        if hasattr(cookie, 'expires') and cookie.expires:
+            cookie_dict["expires"] = cookie.expires
+        if hasattr(cookie, 'sameSite') and cookie.sameSite:
+            cookie_dict["sameSite"] = cookie.sameSite
+        cookie_list.append(cookie_dict)
+
+    local_storage = {}
+    try:
+        local_storage = await page.evaluate("""() => {
+            const items = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                items[key] = localStorage.getItem(key);
+            }
+            return items;
+        }""")
+    except:
+        pass
+
+    auth_data = {
+        "cookies": cookie_list,
+        "localStorage": local_storage,
+        "userDataDir": user_data_dir,
+        "timestamp": __import__("datetime").datetime.now().isoformat(),
+    }
+
+    await browser.stop()
+
+    print()
+    print("=" * 60)
+    print("SUCCESS! Copy the JSON below and paste it into the web app:")
+    print("=" * 60)
+    print()
+    print(json.dumps(auth_data, indent=2))
+    print()
+    print("=" * 60)
+
+    auth_file = os.path.expanduser("~/.twitter_screenshot_auth.json")
+    with open(auth_file, "w") as f:
+        json.dump(auth_data, f, indent=2)
+    print(f"Also saved to: {auth_file}")
+    print()
+
+    return auth_data
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+    response = make_response(auth_script)
+    response.headers["Content-Type"] = "text/plain; charset=utf-8"
+    response.headers["Content-Disposition"] = "attachment; filename=twitter_auth.py"
+    return response
+
+
 # =============================================================================
 # Main
 # =============================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Twitter Screenshot App - Simple Embed Approach")
+    print("Twitter Screenshot App - Authenticated Direct Capture")
     print("=" * 60)
 
     display = os.environ.get('DISPLAY')
@@ -653,6 +922,13 @@ if __name__ == "__main__":
         import sys
         sys.exit(1)
     print(f"Display: {display}")
+
+    # Check auth status
+    auth_status = get_auth_status()
+    if auth_status["authenticated"]:
+        print(f"Auth: Loaded ({auth_status['cookie_count']} cookies)")
+    else:
+        print("Auth: Not configured - run twitter_auth.py locally to set up")
 
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not app.debug:
         start_queue_worker()

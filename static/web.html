@@ -11,6 +11,18 @@
         .header { text-align: center; margin-bottom: 30px; }
         .header h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
         .header p { color: #8899a6; font-size: 14px; }
+        .auth-banner { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 12px 16px; border-radius: 12px; margin-bottom: 20px; cursor: pointer; transition: all 0.2s; }
+        .auth-banner.authenticated { background: rgba(0,186,124,0.1); border: 1px solid rgba(0,186,124,0.3); }
+        .auth-banner.authenticated:hover { background: rgba(0,186,124,0.15); }
+        .auth-banner.unauthenticated { background: rgba(244,33,46,0.1); border: 1px solid rgba(244,33,46,0.3); }
+        .auth-banner.unauthenticated:hover { background: rgba(244,33,46,0.15); }
+        .auth-dot { width: 10px; height: 10px; border-radius: 50%; }
+        .auth-dot.green { background: #00ba7c; }
+        .auth-dot.red { background: #f4212e; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .auth-text { font-size: 14px; }
+        .auth-banner.authenticated .auth-text { color: #00ba7c; }
+        .auth-banner.unauthenticated .auth-text { color: #f4212e; }
         .tabs { display: flex; gap: 8px; margin-bottom: 20px; }
         .tab { flex: 1; padding: 14px 20px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 12px; color: #8899a6; font-size: 15px; font-weight: 600; cursor: pointer; text-align: center; }
         .tab:hover { background: rgba(255,255,255,0.1); }
@@ -30,6 +42,8 @@
         .btn-primary:hover:not(:disabled) { background: #1a8cd8; }
         .btn-success { background: linear-gradient(135deg, #10b981, #059669); color: #fff; }
         .btn-danger { background: #f4212e; color: #fff; }
+        .btn-secondary { background: rgba(255,255,255,0.1); color: #fff; }
+        .btn-secondary:hover:not(:disabled) { background: rgba(255,255,255,0.15); }
         .options-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
         .checkbox-wrapper { display: flex; align-items: center; gap: 8px; }
         .checkbox-wrapper input { width: 18px; height: 18px; }
@@ -73,11 +87,30 @@
         .queue-actions { display: flex; gap: 12px; }
         .queue-actions .btn { flex: 1; }
         .empty-queue { text-align: center; padding: 40px 20px; color: #657786; }
+        /* Modal styles */
+        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-overlay.show { display: flex; }
+        .modal { background: #1a1a2e; border-radius: 16px; padding: 24px; max-width: 500px; width: 90%; max-height: 90vh; overflow-y: auto; border: 1px solid rgba(255,255,255,0.1); }
+        .modal h2 { margin-bottom: 16px; font-size: 20px; }
+        .modal p { color: #8899a6; font-size: 14px; margin-bottom: 16px; line-height: 1.6; }
+        .modal textarea { width: 100%; min-height: 200px; padding: 14px; font-size: 13px; font-family: monospace; border: 2px solid rgba(255,255,255,0.1); border-radius: 12px; background: rgba(0,0,0,0.3); color: #fff; resize: vertical; margin-bottom: 16px; }
+        .modal textarea:focus { outline: none; border-color: #1d9bf0; }
+        .modal-buttons { display: flex; gap: 12px; }
+        .modal-buttons .btn { flex: 1; }
+        .modal code { background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; font-size: 13px; color: #1d9bf0; }
+        .modal ol { color: #8899a6; font-size: 14px; margin: 16px 0; padding-left: 20px; }
+        .modal ol li { margin-bottom: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header"><h1>Twitter Screenshot</h1><p>Capture tweets as high-quality images</p></div>
+
+        <div class="auth-banner unauthenticated" id="authBanner" onclick="openAuthModal()">
+            <span class="auth-dot red" id="authDot"></span>
+            <span class="auth-text" id="authText">Not authenticated - Click to set up</span>
+        </div>
+
         <div class="tabs">
             <button class="tab active" onclick="switchTab(0)">Single URL</button>
             <button class="tab" onclick="switchTab(1)">Batch Queue</button>
@@ -90,7 +123,7 @@
                 </div>
                 <div class="options-row" style="margin-top:0">
                     <div class="checkbox-wrapper"><input type="checkbox" id="hideMetrics"><label for="hideMetrics">Hide metrics</label></div>
-                    <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="400" max="800" value="600"><span class="value" id="widthValue">600px</span></div>
+                    <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="400" max="800" value="550"><span class="value" id="widthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn active" onclick="setTheme(0)">Dark</button><button class="theme-btn" onclick="setTheme(1)">Light</button></div>
                 </div>
                 <div id="status" class="status"></div>
@@ -106,7 +139,7 @@
                 <textarea id="batchUrls" placeholder="Paste tweet URLs (one per line)&#10;&#10;Example:&#10;https://twitter.com/user/status/123&#10;https://x.com/user/status/456"></textarea>
                 <div class="options-row">
                     <div class="checkbox-wrapper"><input type="checkbox" id="batchHideMetrics"><label for="batchHideMetrics">Hide metrics</label></div>
-                    <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="400" max="800" value="600"><span class="value" id="batchWidthValue">600px</span></div>
+                    <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="400" max="800" value="550"><span class="value" id="batchWidthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn batch-theme active" onclick="setBatchTheme(0)">Dark</button><button class="theme-btn batch-theme" onclick="setBatchTheme(1)">Light</button></div>
                 </div>
                 <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="addToQueue()">Add to Queue</button>
@@ -127,13 +160,131 @@
             </div>
         </div>
     </div>
+
+    <!-- Auth Modal -->
+    <div class="modal-overlay" id="authModal" onclick="if(event.target===this)closeAuthModal()">
+        <div class="modal">
+            <h2>Twitter Authentication</h2>
+            <p>Twitter requires login to view tweets. To authenticate:</p>
+            <ol>
+                <li>Download <code>twitter_auth.py</code> from this server</li>
+                <li>Run it on your local machine: <code>python twitter_auth.py</code></li>
+                <li>Log into Twitter in the browser that opens</li>
+                <li>Copy the JSON output and paste it below</li>
+            </ol>
+            <p><a href="/twitter_auth.py" download style="color:#1d9bf0">Download twitter_auth.py</a></p>
+            <textarea id="authJson" placeholder="Paste your auth JSON here..."></textarea>
+            <div id="authModalStatus" class="status"></div>
+            <div class="modal-buttons">
+                <button class="btn btn-secondary" onclick="closeAuthModal()">Cancel</button>
+                <button class="btn btn-danger" onclick="clearAuth()" id="clearAuthBtn" style="display:none">Clear Auth</button>
+                <button class="btn btn-primary" onclick="saveAuth()">Save Auth</button>
+            </div>
+        </div>
+    </div>
+
 <script>
-let theme="dark",batchTheme="dark",width=600,batchWidth=600,filename=null,imageUrl=null,sse=null;
+let theme="dark",batchTheme="dark",width=550,batchWidth=550,filename=null,imageUrl=null,sse=null;
+
+// Auth functions
+async function checkAuthStatus() {
+    try {
+        const res = await fetch("/api/auth/status");
+        const data = await res.json();
+        updateAuthBanner(data);
+    } catch(e) {
+        console.error("Auth check failed:", e);
+    }
+}
+
+function updateAuthBanner(status) {
+    const banner = document.getElementById("authBanner");
+    const dot = document.getElementById("authDot");
+    const text = document.getElementById("authText");
+    const clearBtn = document.getElementById("clearAuthBtn");
+
+    if (status.authenticated) {
+        banner.className = "auth-banner authenticated";
+        dot.className = "auth-dot green";
+        text.textContent = "Authenticated (" + status.cookie_count + " cookies)";
+        clearBtn.style.display = "block";
+    } else {
+        banner.className = "auth-banner unauthenticated";
+        dot.className = "auth-dot red";
+        text.textContent = "Not authenticated - Click to set up";
+        clearBtn.style.display = "none";
+    }
+}
+
+function openAuthModal() {
+    document.getElementById("authModal").classList.add("show");
+}
+
+function closeAuthModal() {
+    document.getElementById("authModal").classList.remove("show");
+    document.getElementById("authJson").value = "";
+    document.getElementById("authModalStatus").className = "status";
+}
+
+async function saveAuth() {
+    const json = document.getElementById("authJson").value.trim();
+    if (!json) {
+        showStatus("authModalStatus", "error", "Please paste your auth JSON");
+        return;
+    }
+
+    let authData;
+    try {
+        authData = JSON.parse(json);
+    } catch(e) {
+        showStatus("authModalStatus", "error", "Invalid JSON format");
+        return;
+    }
+
+    if (!authData.cookies || !authData.cookies.length) {
+        showStatus("authModalStatus", "error", "No cookies found in auth data");
+        return;
+    }
+
+    try {
+        const res = await fetch("/api/auth/save", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(authData)
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            showStatus("authModalStatus", "success", "Auth saved!");
+            updateAuthBanner(data.status);
+            setTimeout(closeAuthModal, 1500);
+        } else {
+            showStatus("authModalStatus", "error", data.error || "Failed to save");
+        }
+    } catch(e) {
+        showStatus("authModalStatus", "error", "Network error");
+    }
+}
+
+async function clearAuth() {
+    if (!confirm("Clear authentication? You'll need to re-authenticate to capture tweets.")) return;
+
+    try {
+        await fetch("/api/auth/clear", {method: "POST"});
+        checkAuthStatus();
+        closeAuthModal();
+    } catch(e) {
+        showStatus("authModalStatus", "error", "Failed to clear auth");
+    }
+}
+
+// Tab functions
 function switchTab(n){document.querySelectorAll(".tab").forEach((t,i)=>t.classList.toggle("active",i===n));document.querySelectorAll(".tab-content").forEach((c,i)=>c.classList.toggle("active",i===n));if(n===1&&!sse)connectSSE();}
 function setTheme(n){theme=n?"light":"dark";document.querySelectorAll(".theme-toggle:not(:has(.batch-theme)) .theme-btn").forEach((b,i)=>b.classList.toggle("active",i===n));}
 function setBatchTheme(n){batchTheme=n?"light":"dark";document.querySelectorAll(".batch-theme").forEach((b,i)=>b.classList.toggle("active",i===n));}
 document.getElementById("widthSlider").oninput=e=>{width=+e.target.value;document.getElementById("widthValue").textContent=width+"px";};
 document.getElementById("batchWidthSlider").oninput=e=>{batchWidth=+e.target.value;document.getElementById("batchWidthValue").textContent=batchWidth+"px";};
+
 async function captureTweet(){
     const url=document.getElementById("tweetUrl").value.trim(),btn=document.getElementById("captureBtn"),preview=document.getElementById("preview"),actions=document.getElementById("actionButtons");
     if(!url||!url.match(/(?:twitter\.com|x\.com)\/\w+\/status\/\d+/)){showStatus("status","error","Enter a valid tweet URL");return;}
@@ -147,11 +298,12 @@ async function captureTweet(){
     }catch(e){showStatus("status","error","Network error");preview.innerHTML="<p class=\"placeholder\">Error</p>";}
     finally{btn.disabled=false;btn.innerHTML="Capture";}
 }
+
 async function copyImage(){const btn=document.getElementById("copyBtn");try{btn.textContent="Copying...";btn.disabled=true;const blob=await(await fetch(imageUrl)).blob();await navigator.clipboard.write([new ClipboardItem({"image/png":blob})]);showStatus("status","success","Copied!");}catch(e){showStatus("status","error","Copy failed");}finally{btn.textContent="Copy to Clipboard";btn.disabled=false;}}
 function downloadImage(){if(!imageUrl)return;const a=document.createElement("a");a.href="/api/download/"+filename;a.download=filename;a.click();}
+
 async function addToQueue(){
     const urls=document.getElementById("batchUrls").value.split(/[\r\n]+/).map(u=>u.trim()).filter(u=>u);
-    console.log("Parsed URLs:", urls);
     if(!urls.length){showStatus("batchStatus","error","Enter at least one URL");return;}
     if(urls.length>50){showStatus("batchStatus","error","Max 50 URLs");return;}
     try{
@@ -161,6 +313,7 @@ async function addToQueue(){
         if(data.errors&&data.errors.length)showStatus("batchStatus","error",data.errors.length+" failed");
     }catch(e){showStatus("batchStatus","error","Failed");}
 }
+
 function connectSSE(){if(sse)sse.close();sse=new EventSource("/api/queue/stream");sse.addEventListener("queue_update",e=>updateQueueUI(JSON.parse(e.data).items));sse.onerror=()=>setTimeout(connectSSE,3000);}
 function updateQueueUI(items){
     const c={pending:0,processing:0,done:0,error:0};items.forEach(i=>c[i.status]++);
@@ -170,12 +323,17 @@ function updateQueueUI(items){
     if(!items.length){list.innerHTML="<div class=\"empty-queue\">No items in queue</div>";return;}
     list.innerHTML=items.map(i=>"<div class=\"queue-item\"><span class=\"queue-item-url\">"+i.url+"</span><span class=\"queue-item-status status-"+i.status+"\">"+i.status+"</span>"+(i.status==="done"?"<div class=\"queue-item-actions\"><button class=\"btn btn-success\" onclick=\"downloadSingle(\\x27"+i.id+"\\x27)\">Download</button></div>":"")+(i.status==="error"?"<span style=\"color:#f4212e;font-size:12px\">"+(i.error||"Failed").substring(0,30)+"</span>":"")+"</div>").join("");
 }
+
 function downloadSingle(id){const a=document.createElement("a");a.href="/api/queue/download/"+id;a.download="";document.body.appendChild(a);a.click();document.body.removeChild(a);}
 function downloadAll(){const a=document.createElement("a");a.href="/api/queue/download-all";a.download="";document.body.appendChild(a);a.click();document.body.removeChild(a);}
 async function clearQueue(){if(confirm("Clear queue?")){await fetch("/api/queue/clear",{method:"POST"});showStatus("batchStatus","success","Cleared");}}
 function showStatus(id,type,msg){const el=document.getElementById(id);el.className="status "+type;el.innerHTML=msg;if(type==="success")setTimeout(()=>el.className="status",3000);}
+
 document.getElementById("tweetUrl").addEventListener("paste",function(){setTimeout(()=>{if(this.value.trim())captureTweet();},100);});
 document.getElementById("tweetUrl").addEventListener("keypress",e=>{if(e.key==="Enter")captureTweet();});
+
+// Check auth on load
+checkAuthStatus();
 </script>
 </body>
 </html>
