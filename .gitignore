@@ -13,6 +13,9 @@ screenshots/
 .vscode/
 .idea/
 
+# Config with secrets (auth tokens, credentials)
+config/
+
 # OS
 .DS_Store
 Thumbs.db
