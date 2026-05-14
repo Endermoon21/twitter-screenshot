@@ -1,27 +1,11 @@
-# Python
 venv/
 __pycache__/
 *.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Screenshots output
-screenshots/
-
-# IDE
+config/
+*.bak
+*.bak-*
+output/
+*.log
 .vscode/
 .idea/
-
-# Config with secrets (auth tokens, credentials)
-config/
-
-# OS
 .DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Temp
-*.tmp

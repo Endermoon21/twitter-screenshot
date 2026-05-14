@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 Twitter Screenshot App with Authentication
-- Uses Playwright for reliable browser automation
-- Supports Twitter login via cookies or auto-login
+- Uses Playwright for reliable screenshot capture
+- Supports Twitter login via exported cookies
 - Batch queue with real-time SSE progress
 - ZIP download support
 """
 
-import asyncio
 import json
 import logging
 import os
@@ -25,7 +24,7 @@ from pathlib import Path
 from flask import (Flask, Response, jsonify, make_response, render_template,
                    request, send_file, stream_with_context)
 
-from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 
 # =============================================================================
 # Logging Configuration
@@ -41,22 +40,15 @@ logger = logging.getLogger('twitter-screenshot')
 # Configuration
 # =============================================================================
 
-CHROME_PATH = '/usr/bin/google-chrome-stable'
 SAVE_DIR = "/tmp/twitter_screenshots"
 CONFIG_DIR = "/opt/twitter-screenshot/config"
 AUTH_FILE = os.path.join(CONFIG_DIR, "auth.json")
-CREDENTIALS_FILE = os.path.join(CONFIG_DIR, "credentials.json")
-PROFILE_DIR = "/opt/twitter-screenshot/config/chrome_profile"  # Persistent browser profile
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 os.makedirs(CONFIG_DIR, exist_ok=True)
-os.makedirs(PROFILE_DIR, exist_ok=True)
 
 MAX_QUEUE_SIZE = 50
 MAX_SCREENSHOT_AGE = 3600
-AUTO_LOGIN_LOCK = threading.Lock()
-LAST_LOGIN_ATTEMPT = 0
-LOGIN_COOLDOWN = 300  # 5 minutes between auto-login attempts
 
 # =============================================================================
 # Flask App
@@ -114,51 +106,8 @@ def clear_auth():
         logger.info("Auth cleared")
 
 
-def load_credentials():
-    """Load Twitter credentials for auto-login"""
-    if os.path.exists(CREDENTIALS_FILE):
-        try:
-            with open(CREDENTIALS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Failed to load credentials: {e}")
-    return None
-
-
-def save_credentials(username, password):
-    """Save Twitter credentials for auto-login"""
-    try:
-        with open(CREDENTIALS_FILE, 'w') as f:
-            json.dump({"username": username, "password": password}, f)
-        os.chmod(CREDENTIALS_FILE, 0o600)  # Restrict permissions
-        logger.info("Credentials saved")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save credentials: {e}")
-        return False
-
-
 def get_auth_status():
     """Get current authentication status"""
-    # Check storage_state.json first (Playwright format)
-    storage_file = os.path.join(CONFIG_DIR, "storage_state.json")
-    if os.path.exists(storage_file):
-        try:
-            with open(storage_file, 'r') as f:
-                data = json.load(f)
-            cookies = data.get("cookies", [])
-            has_auth_token = any(c.get("name") == "auth_token" for c in cookies)
-            has_ct0 = any(c.get("name") == "ct0" for c in cookies)
-            if has_auth_token or has_ct0:
-                return {
-                    "authenticated": True,
-                    "cookie_count": len(cookies),
-                    "source": "storage_state.json"
-                }
-        except:
-            pass
-
-    # Fall back to auth.json
     auth = load_auth()
     if not auth:
         return {"authenticated": False}
@@ -170,8 +119,50 @@ def get_auth_status():
     return {
         "authenticated": has_auth_token or has_ct0,
         "cookie_count": len(cookies),
-        "source": "auth.json"
+        "timestamp": auth.get("timestamp"),
     }
+
+
+def convert_to_playwright_storage(auth_data):
+    """Convert our auth format to Playwright's storage_state format"""
+    if not auth_data or not auth_data.get("cookies"):
+        return None
+
+    # Convert cookies to Playwright format
+    cookies = []
+    for cookie in auth_data.get("cookies", []):
+        pw_cookie = {
+            "name": cookie["name"],
+            "value": cookie["value"],
+            "domain": cookie.get("domain", ".x.com"),
+            "path": cookie.get("path", "/"),
+            "secure": cookie.get("secure", True),
+            "httpOnly": cookie.get("httpOnly", False),
+            "sameSite": cookie.get("sameSite", "Lax"),
+        }
+        # Add expiry if present
+        if cookie.get("expires") or cookie.get("expirationDate"):
+            pw_cookie["expires"] = cookie.get("expires") or cookie.get("expirationDate")
+        cookies.append(pw_cookie)
+
+    # Build storage state
+    storage_state = {
+        "cookies": cookies,
+        "origins": []
+    }
+
+    # Add localStorage if present
+    if auth_data.get("localStorage"):
+        local_storage_items = []
+        for key, value in auth_data["localStorage"].items():
+            local_storage_items.append({"name": key, "value": value})
+
+        storage_state["origins"].append({
+            "origin": "https://x.com",
+            "localStorage": local_storage_items
+        })
+
+    return storage_state
 
 # =============================================================================
 # Helper Functions
@@ -241,680 +232,417 @@ def broadcast_queue_update():
                 pass
 
 # =============================================================================
-# Capture Functions (Playwright)
+# Capture Functions
 # =============================================================================
 
-async def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, width=550):
-    """Capture tweet using Playwright with persistent context"""
-    playwright = None
-    browser = None
-    context = None
-
+def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, width=550):
+    """Capture tweet using Playwright with authentication"""
     try:
-        playwright = await async_playwright().start()
-
-        # Launch browser in headless mode with stealth settings
-        logger.info("Starting Playwright browser...")
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-blink-features=AutomationControlled',
-                '--lang=en-US',
-                '--accept-lang=en-US,en',
-            ]
-        )
-
-        # Create context with persistent storage and stealth settings
-        # Use larger height for quote tweets
-        context = await browser.new_context(
-            viewport={'width': width, 'height': 2400},
-            device_scale_factor=2,
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            locale='en-US',
-            timezone_id='America/New_York',
-            color_scheme='dark' if theme == 'dark' else 'light',
-            storage_state=os.path.join(CONFIG_DIR, "storage_state.json") if os.path.exists(os.path.join(CONFIG_DIR, "storage_state.json")) else None
-        )
-
-        # Add script to hide webdriver
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            window.chrome = {runtime: {}};
-        """)
-
-        # Apply saved cookies if available
+        # Load auth data
         auth = load_auth()
-        if auth and auth.get("cookies"):
-            logger.info("Applying saved cookies...")
-            cookies_to_add = []
-            for cookie in auth["cookies"]:
-                c = {
-                    "name": cookie["name"],
-                    "value": cookie["value"],
-                    "domain": cookie.get("domain", ".x.com"),
-                    "path": cookie.get("path", "/"),
+        storage_state = convert_to_playwright_storage(auth)
+
+        with sync_playwright() as p:
+            # Launch browser
+            browser = p.chromium.launch(
+                headless=False,  # Xvfb provides display
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                ]
+            )
+
+            # Create context with storage state if available
+            context_args = {
+                "viewport": {"width": width, "height": 1200},
+                "device_scale_factor": 2,
+                "color_scheme": "dark" if theme == "dark" else "light",
+            }
+
+            if storage_state:
+                logger.info(f"Applying {len(storage_state['cookies'])} cookies...")
+                context_args["storage_state"] = storage_state
+
+            context = browser.new_context(**context_args)
+            page = context.new_page()
+
+            # Navigate to tweet
+            logger.info(f"Loading tweet: {url}")
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # Wait for page to load
+            page.wait_for_timeout(3000)
+
+            # Log the actual URL after navigation (check for redirects)
+            actual_url = page.url
+            logger.info(f"Actual URL after navigation: {actual_url}")
+
+            # Debug: Check page content for errors and retry if needed
+            page_title = page.title()
+            has_error = page.evaluate('document.body.innerText.includes("Something went wrong")')
+            logger.info(f"Page title: {page_title}, Has error: {has_error}")
+
+            # If Twitter shows error, try clicking Retry or reloading
+            if has_error:
+                logger.warning("Twitter error detected, attempting retry...")
+                # Try clicking the Retry button
+                retry_btn = page.query_selector('button:has-text("Retry"), [role="button"]:has-text("Retry")')
+                if retry_btn:
+                    retry_btn.click()
+                    page.wait_for_timeout(3000)
+                else:
+                    # Just reload
+                    page.reload()
+                    page.wait_for_timeout(3000)
+
+                # Check again
+                has_error = page.evaluate('document.body.innerText.includes("Something went wrong")')
+                if has_error:
+                    logger.error("Twitter still showing error after retry")
+
+
+            # Check if we hit the login wall
+            body_text = page.evaluate('document.body.innerText')
+
+            if "Log in to X" in body_text or ("Log in" in body_text and "Sign up" in body_text and "article" not in page.content()):
+                logger.warning("Login wall detected - trying to reload...")
+                page.reload()
+                page.wait_for_timeout(3000)
+                body_text = page.evaluate('document.body.innerText')
+
+                if "Log in to X" in body_text or ("Log in" in body_text and "Sign up" in body_text and "article" not in page.content()):
+                    logger.error("Login wall still present - auth may be expired")
+                    browser.close()
+                    return {"success": False, "error": "Login required - please update your authentication"}
+
+            # Try to find tweet element
+            tweet_found = False
+            for i in range(10):
+                try:
+                    has_article = page.evaluate('!!document.querySelector("article")')
+                    if has_article:
+                        tweet_found = True
+                        logger.info(f"Tweet found after {i+1}s")
+                        break
+                except:
+                    pass
+                page.wait_for_timeout(1000)
+
+            if not tweet_found:
+                browser.close()
+                return {"success": False, "error": "Could not find tweet - it may not exist or be private"}
+
+            # Wait for images to load
+            page.evaluate('''() => {
+                return new Promise(resolve => {
+                    const images = document.querySelectorAll('img');
+                    let loaded = 0;
+                    const total = images.length;
+                    if (total === 0) { resolve(); return; }
+                    const checkDone = () => { if (++loaded >= total) resolve(); };
+                    images.forEach(img => {
+                        if (img.complete) checkDone();
+                        else { img.onload = checkDone; img.onerror = checkDone; }
+                    });
+                    setTimeout(resolve, 5000);
+                });
+            }''')
+
+            # NOTE: "Show more" click code removed - it was causing quote tweet content to disappear
+            # Wait a moment for content to settle
+            page.wait_for_timeout(300)
+
+            # Hide metrics if requested
+            if hide_metrics:
+                page.evaluate('''() => {
+                    document.querySelectorAll('[data-testid="like"], [data-testid="retweet"], [data-testid="reply"]')
+                        .forEach(el => {
+                            const parent = el.closest('[role="group"]');
+                            if (parent) parent.style.display = 'none';
+                        });
+                }''')
+
+            # Remove UI clutter for cleaner screenshot
+            # Pass the username from URL to find the correct article
+            target_username = parsed['username'].lower()
+            page.evaluate('''(targetUser) => {
+                // Hide scrollbars and set consistent background
+                document.documentElement.style.overflow = 'hidden';
+                document.body.style.overflow = 'hidden';
+                document.documentElement.style.scrollbarWidth = 'none';
+                document.body.style.scrollbarWidth = 'none';
+
+                // Set background color based on theme (prevents black bars)
+                const isDark = document.documentElement.style.colorScheme === 'dark' ||
+                               window.matchMedia('(prefers-color-scheme: dark)').matches ||
+                               document.body.style.backgroundColor.includes('0, 0, 0');
+                const bgColor = isDark ? 'rgb(0, 0, 0)' : 'rgb(255, 255, 255)';
+                document.body.style.backgroundColor = bgColor;
+                document.documentElement.style.backgroundColor = bgColor;
+
+                const style = document.createElement('style');
+                style.textContent = `
+                    ::-webkit-scrollbar { display: none !important; }
+                    /* Ensure quoted tweets expand fully - but don't change display */
+                    [data-testid="card.wrapper"],
+                    [data-testid="quoteTweet"],
+                    [data-testid="tweetText"] {
+                        max-height: none !important;
+                        overflow: visible !important;
+                        -webkit-line-clamp: unset !important;
+                    }
+                `;
+                document.head.appendChild(style);
+                // Hide UI elements using CSS (safer than removing)
+                const hideEl = (el) => { if (el) el.style.display = 'none'; };
+                hideEl(document.querySelector('[data-testid="BottomBar"]'));
+                hideEl(document.querySelector('[data-testid="sidebarColumn"]'));
+                hideEl(document.querySelector('header[role="banner"]'));
+                document.querySelectorAll('[role="dialog"]').forEach(hideEl);
+                document.querySelectorAll('[aria-label="Timeline: Trending now"]').forEach(hideEl);
+                document.querySelectorAll('[data-testid="sheetDialog"]').forEach(hideEl);
+
+                // Hide the "< Post" navigation bar at top of tweet page
+                const backButton = document.querySelector('[aria-label="Back"]');
+                if (backButton) {
+                    let el = backButton;
+                    for (let i = 0; i < 10 && el; i++) {
+                        el = el.parentElement;
+                        if (el && (el.getAttribute('data-testid') === 'primaryColumn' ||
+                                   el.tagName === 'MAIN')) {
+                            break;
+                        }
+                        if (el && el.textContent && el.textContent.includes('Post')) {
+                            el.style.display = 'none';
+                            break;
+                        }
+                    }
                 }
-                if cookie.get("expires"):
-                    c["expires"] = cookie["expires"]
-                if cookie.get("secure"):
-                    c["secure"] = cookie["secure"]
-                if cookie.get("httpOnly"):
-                    c["httpOnly"] = cookie["httpOnly"]
-                cookies_to_add.append(c)
-            await context.add_cookies(cookies_to_add)
-            logger.info(f"Applied {len(cookies_to_add)} cookies")
 
-        page = await context.new_page()
+                // Hide the "More Tweets" section and replies
+                // IMPORTANT: Find the article matching the URL's username (for quote tweets)
+                const articles = document.querySelectorAll('article');
+                let targetArticle = null;
 
-        # Navigate to tweet
-        logger.info(f"Loading tweet: {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(3000)
+                // First, try to find article with matching username
+                for (let idx = 0; idx < articles.length; idx++) {
+                    const art = articles[idx];
+                    const userNameEl = art.querySelector('[data-testid="User-Name"]');
+                    if (userNameEl) {
+                        const links = userNameEl.querySelectorAll('a[href*="/"]');
+                        for (const link of links) {
+                            const href = link.getAttribute('href') || '';
+                            const username = href.replace('/', '').toLowerCase();
+                            if (username === targetUser.toLowerCase()) {
+                                targetArticle = art;
+                                break;
+                            }
+                        }
+                    }
+                    if (targetArticle) break;
+                }
 
-        # Check for login wall - but only if there's no actual tweet content
-        body_text = await page.evaluate('document.body.innerText')
-        logger.info(f"Page text preview: {body_text[:200]}...")
+                // If no match found, fall back to first article
+                if (!targetArticle && articles.length > 0) {
+                    targetArticle = articles[0];
+                }
 
-        # Check if we need to login - simply check if storage_state exists
-        storage_exists = os.path.exists(os.path.join(CONFIG_DIR, "storage_state.json"))
-        has_article = await page.query_selector('article')
+                // Hide all other articles (don't remove to avoid React crash)
+                for (const art of articles) {
+                    if (art !== targetArticle) {
+                        art.style.display = 'none';
+                    }
+                }
 
-        if not storage_exists:
-            logger.warning("Login wall detected - attempting auto-login...")
+                // Use the target article for further processing
+                const article = targetArticle;
+                if (article) {
+                    // Hide "Relevant" dropdown and "View quotes" links
+                    article.querySelectorAll('span').forEach(span => {
+                        const text = span.textContent.trim();
+                        if (text === 'Relevant' || text === 'View quotes' || text.includes('View quotes')) {
+                            let el = span;
+                            for (let i = 0; i < 6 && el; i++) {
+                                el = el.parentElement;
+                                if (el && (el.getAttribute('role') === 'button' || el.tagName === 'A')) {
+                                    el.style.display = 'none';
+                                    break;
+                                }
+                            }
+                        }
+                    });
 
-            login_success = await perform_auto_login_playwright(page)
+                    // Hide content after the LAST engagement bar (replies section)
+                    const groups = article.querySelectorAll('[role="group"]');
+                    if (groups.length > 0) {
+                        const lastGroup = groups[groups.length - 1];
+                        let next = lastGroup.parentElement?.nextElementSibling;
+                        while (next) {
+                            next.style.display = 'none';
+                            next = next.nextElementSibling;
+                        }
+                    }
+                }
+            }''', target_username)
 
-            if login_success:
-                logger.info("Auto-login succeeded, retrying tweet capture...")
-                # Save storage state for future use
-                await context.storage_state(path=os.path.join(CONFIG_DIR, "storage_state.json"))
+            page.wait_for_timeout(500)
 
-                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(2000)
-                body_text = await page.evaluate('document.body.innerText')
-
-                if "Log in to X" in body_text:
-                    await browser.close()
-                    await playwright.stop()
-                    return {"success": False, "error": "Auto-login failed - check credentials"}
-            else:
-                await browser.close()
-                await playwright.stop()
-                return {"success": False, "error": "Login required - set credentials via /api/credentials"}
-
-        # Wait for tweet article
-        try:
-            await page.wait_for_selector('article', timeout=15000)
-            logger.info("Tweet found")
-        except Exception as e:
-            # Debug: log what we see on the page
-            body_text = await page.evaluate('document.body.innerText')
-            logger.error(f"No article found. Page text preview: {body_text[:500]}")
-            current_url = page.url
-            logger.error(f"Current URL: {current_url}")
-            await browser.close()
-            await playwright.stop()
-            return {"success": False, "error": f"Could not find tweet. URL: {current_url}"}
-
-        # Check for quote tweet - if found, get full text and inject it back
-        await page.wait_for_timeout(2000)  # Let quote tweet load
-        try:
-            current_tweet_id = parsed['tweet_id']
-            original_url = url
-
-            quote_url = await page.evaluate('''(currentTweetId) => {
+            # Position article for screenshot and get clip bounds
+            clip = page.evaluate('''() => {
                 const article = document.querySelector('article');
                 if (!article) return null;
 
-                function getDifferentTweetUrl(href) {
-                    if (!href || !href.includes('/status/')) return null;
-                    const match = href.match(/(\\/[^\\/]+\\/status\\/(\\d+))/);
-                    if (!match) return null;
-                    const basePath = match[1];
-                    const tweetId = match[2];
-                    if (tweetId === currentTweetId) return null;
-                    if (href.includes('/analytics') || href.includes('/retweets') ||
-                        href.includes('/quotes') || href.includes('/likes')) return null;
-                    return 'https://x.com' + basePath;
+                // Remove top padding/margin from containers
+                const primaryColumn = document.querySelector('[data-testid="primaryColumn"]');
+                if (primaryColumn) {
+                    primaryColumn.style.paddingTop = '0';
+                    primaryColumn.style.marginTop = '0';
                 }
 
-                // Find quote tweet URL
-                const allStatusLinks = article.querySelectorAll('a[href*="/status/"]');
-                for (const link of allStatusLinks) {
-                    const url = getDifferentTweetUrl(link.getAttribute('href'));
-                    if (url) {
-                        const isInTweetText = link.closest('[data-testid="tweetText"]');
-                        if (!isInTweetText) return url;
+                // Walk up and remove padding
+                let container = article.parentElement;
+                for (let i = 0; i < 10 && container && container !== document.body; i++) {
+                    container.style.paddingTop = '0';
+                    container.style.marginTop = '0';
+                    container = container.parentElement;
+                }
+
+                // Add spacer above article to ensure profile pic is visible
+                // This is needed because removing the header puts article at y=0
+                const spacer = document.createElement('div');
+                spacer.style.height = '50px';
+                spacer.style.backgroundColor = 'inherit';
+                article.parentElement.insertBefore(spacer, article);
+
+                // Scroll to top
+                window.scrollTo(0, 0);
+
+                // Get position after adding spacer
+                let rect = article.getBoundingClientRect();
+
+                // IMPORTANT: Find the actual top by checking profile pic, which is often above article rect
+                let topY = rect.top;
+
+                // Check avatar
+                const avatar = article.querySelector('[data-testid="Tweet-User-Avatar"]');
+                if (avatar) {
+                    const avatarRect = avatar.getBoundingClientRect();
+                    topY = Math.min(topY, avatarRect.top);
+                    console.log('Avatar top:', avatarRect.top, 'Article top:', rect.top);
+                }
+
+                // Also check for any profile images
+                const profileImg = article.querySelector('img[src*="profile_images"]');
+                if (profileImg) {
+                    const imgRect = profileImg.getBoundingClientRect();
+                    topY = Math.min(topY, imgRect.top);
+                }
+
+                // Check user name element too
+                const userName = article.querySelector('[data-testid="User-Name"]');
+                if (userName) {
+                    const nameRect = userName.getBoundingClientRect();
+                    topY = Math.min(topY, nameRect.top);
+                }
+
+                // Find the BOTTOMMOST engagement bar (main tweet's, not embedded tweet's)
+                let bottomY = rect.bottom;
+                const groups = article.querySelectorAll('[role="group"]');
+                let maxGroupBottom = 0;
+
+                // Find ALL engagement bars and use the one with the LARGEST Y (bottommost)
+                for (const g of groups) {
+                    if (g.querySelector('[data-testid="like"]') || g.querySelector('[data-testid="reply"]')) {
+                        const gBottom = g.getBoundingClientRect().bottom;
+                        if (gBottom > maxGroupBottom) {
+                            maxGroupBottom = gBottom;
+                        }
                     }
                 }
-                return null;
-            }''', current_tweet_id)
 
-            logger.info(f"Quote detection result: {quote_url}")
+                if (maxGroupBottom > 0) {
+                    bottomY = maxGroupBottom;
+                }
 
-            if quote_url:
-                logger.info(f"Found quote tweet, fetching full text from: {quote_url}")
-
-                # Navigate to quote tweet to get full text
-                await page.goto(quote_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(3000)
-                await page.wait_for_selector('article', timeout=15000)
-
-                # Extract the full tweet text
-                full_quote_text = await page.evaluate('''() => {
-                    const article = document.querySelector('article');
-                    if (!article) return null;
-                    const tweetText = article.querySelector('[data-testid="tweetText"]');
-                    return tweetText ? tweetText.innerText : null;
-                }''')
-
-                logger.info(f"Got full quote text: {full_quote_text[:100] if full_quote_text else 'None'}...")
-
-                # Go back to original tweet
-                await page.goto(original_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(3000)
-                await page.wait_for_selector('article', timeout=15000)
-
-                # Inject the full text into the quote preview
-                if full_quote_text:
-                    injected = await page.evaluate('''(fullText) => {
-                        const article = document.querySelector('article');
-                        if (!article) return false;
-
-                        // Find the quote container - it's usually a div with role="link" that's not the main tweet
-                        const mainTweetText = article.querySelector('[data-testid="tweetText"]');
-                        const quoteContainers = article.querySelectorAll('div[role="link"]');
-
-                        for (const container of quoteContainers) {
-                            // Skip if this contains the main tweet text
-                            if (mainTweetText && container.contains(mainTweetText)) continue;
-
-                            // Look for text elements that look like tweet content
-                            const textElements = container.querySelectorAll('span[dir="ltr"], div[dir="ltr"], [lang]');
-                            for (const el of textElements) {
-                                const text = el.innerText || '';
-                                // Skip short text (usernames, dates, etc.)
-                                if (text.length < 30) continue;
-                                // Skip if it contains the full text already
-                                if (text.length > fullText.length) continue;
-
-                                // This is likely the quote text container
-                                console.log('Found quote text element with:', text.substring(0, 50));
-
-                                // Create a new element with full text
-                                const newEl = document.createElement('div');
-                                newEl.innerText = fullText;
-                                newEl.style.whiteSpace = 'pre-wrap';
-                                newEl.style.wordBreak = 'break-word';
-                                newEl.style.fontSize = getComputedStyle(el).fontSize;
-                                newEl.style.fontFamily = getComputedStyle(el).fontFamily;
-                                newEl.style.color = getComputedStyle(el).color;
-                                newEl.style.lineHeight = getComputedStyle(el).lineHeight;
-
-                                // Replace the old element
-                                el.parentElement.replaceChild(newEl, el);
-
-                                console.log('Replaced quote text with full text');
-                                return true;
-                            }
+                // For quote tweets: ensure we capture content ABOVE the embedded tweet too
+                // The main tweet's text should be included even if it's at the top
+                const allTweetTexts = article.querySelectorAll('[data-testid="tweetText"]');
+                if (allTweetTexts.length > 1) {
+                    // Multiple tweet texts = likely a quote tweet
+                    // Make sure bottomY includes all content
+                    allTweetTexts.forEach(tt => {
+                        const ttRect = tt.getBoundingClientRect();
+                        // If any text is below our current bottom, extend
+                        if (ttRect.bottom > bottomY) {
+                            bottomY = ttRect.bottom + 50; // Add padding for engagement bar
                         }
-                        return false;
-                    }''', full_quote_text)
-
-                    if injected:
-                        logger.info("Successfully injected full quote text")
-                    else:
-                        logger.warning("Could not find quote text element to inject")
-
-                    logger.info("Injected full quote text into original tweet")
-                    await page.wait_for_timeout(500)
-
-        except Exception as e:
-            logger.warning(f"Quote text injection failed: {e}")
-
-        # Scroll down to trigger lazy loading of quote tweets
-        await page.evaluate('''() => {
-            const article = document.querySelector('article');
-            if (article) {
-                article.scrollIntoView({behavior: 'instant', block: 'start'});
-                window.scrollBy(0, 500);  // Scroll down a bit
-            }
-        }''')
-        await page.wait_for_timeout(1000)
-
-        # Scroll back up
-        await page.evaluate('window.scrollTo(0, 0)')
-        await page.wait_for_timeout(500)
-
-        # Wait for images
-        await page.evaluate('''() => {
-            return new Promise(resolve => {
-                const images = document.querySelectorAll('img');
-                let loaded = 0;
-                const total = images.length;
-                if (total === 0) { resolve(); return; }
-                const checkDone = () => { if (++loaded >= total) resolve(); };
-                images.forEach(img => {
-                    if (img.complete) checkDone();
-                    else { img.onload = checkDone; img.onerror = checkDone; }
-                });
-                setTimeout(resolve, 5000);
-            });
-        }''')
-
-        # Auto-translate tweets if translation button exists
-        try:
-            await page.wait_for_timeout(1500)  # Let page fully settle
-
-            # Use Playwright's get_by_text for reliable text matching
-            translate_locator = page.get_by_text("Show translation", exact=True)
-            if await translate_locator.count() > 0:
-                logger.info("Found 'Show translation' button, clicking...")
-                await translate_locator.first.click()
-                await page.wait_for_timeout(4000)
-
-                # Check if translation failed - retry up to 2 times
-                for retry in range(2):
-                    error_text = await page.evaluate('document.body.innerText')
-                    if "Unable to fetch" in error_text or "unable to" in error_text.lower():
-                        logger.info(f"Translation failed, retry {retry + 1}...")
-                        # Look for retry button or click translate again
-                        retry_btn = page.get_by_text("Retry", exact=True)
-                        if await retry_btn.count() > 0:
-                            await retry_btn.first.click()
-                        else:
-                            # Try clicking Show translation again
-                            show_btn = page.get_by_text("Show translation", exact=True)
-                            if await show_btn.count() > 0:
-                                await show_btn.first.click()
-                        await page.wait_for_timeout(4000)
-                    else:
-                        break
-
-                logger.info("Translation handling complete")
-        except Exception as e:
-            logger.debug(f"No translation needed or error: {e}")
-
-        # Hide metrics if requested
-        if hide_metrics:
-            await page.evaluate('''() => {
-                document.querySelectorAll('[data-testid="like"], [data-testid="retweet"], [data-testid="reply"]')
-                    .forEach(el => {
-                        const parent = el.closest('[role="group"]');
-                        if (parent) parent.style.display = 'none';
                     });
+                }
+
+
+                // Return clip region with padding
+                const topPadding = 15;
+                const sidePadding = 12;
+                const bottomPadding = 8;
+
+                return {
+                    x: Math.max(0, rect.left - sidePadding),
+                    y: Math.max(0, topY - topPadding),
+                    width: rect.width + (sidePadding * 2),
+                    height: (bottomY - topY) + topPadding + bottomPadding
+                };
             }''')
 
-        # Clean up UI
-        await page.evaluate('''() => {
-            document.querySelector('[data-testid="BottomBar"]')?.remove();
-            document.querySelectorAll('[role="dialog"]').forEach(e => e.remove());
-            document.querySelector('[data-testid="sidebarColumn"]')?.remove();
-            document.querySelector('header[role="banner"]')?.remove();
-            document.querySelectorAll('[aria-label="Timeline: Trending now"]').forEach(e => e.remove());
-            document.querySelectorAll('[data-testid="sheetDialog"]').forEach(e => e.remove());
+            page.wait_for_timeout(200)
 
-            // Hide all articles except the first one (main tweet)
-            const articles = document.querySelectorAll('article');
-            if (articles.length > 1) {
-                for (let i = 1; i < articles.length; i++) {
-                    articles[i].style.display = 'none';
-                }
-            }
+            # Take screenshot with clip (Playwright handles scaling)
+            screenshot_path = f"/tmp/tweet_{parsed['tweet_id']}_{int(time.time())}.png"
 
-            // Remove cellInnerDiv elements AFTER the first article (replies section)
-            // But be careful not to remove the article itself
-            const cellDivs = document.querySelectorAll('[data-testid="cellInnerDiv"]');
-            let foundMainArticle = false;
-            cellDivs.forEach(el => {
-                const hasArticle = el.querySelector('article');
-                if (hasArticle && !foundMainArticle) {
-                    foundMainArticle = true;  // This is the main tweet
-                } else if (foundMainArticle) {
-                    // This is after the main tweet - hide it (replies, "Read X replies", etc)
-                    el.style.display = 'none';
-                }
-            });
 
-            // Hide "Read X replies" link that appears below the metrics bar
-            const article = document.querySelector('article');
-            if (article) {
-                // Find ALL elements and check for "Read X replies" text
-                const walker = document.createTreeWalker(article, NodeFilter.SHOW_TEXT, null, false);
-                const nodesToHide = [];
-                while (walker.nextNode()) {
-                    const text = walker.currentNode.textContent || '';
-                    if (text.match(/Read\\s+\\d+.*repl/i)) {
-                        // Found the text, hide the containing link/div
-                        let el = walker.currentNode.parentElement;
-                        while (el && el !== article) {
-                            // Go up until we find a suitable container to hide
-                            if (el.tagName === 'A' || el.getAttribute('role') === 'link' ||
-                                (el.tagName === 'DIV' && el.children.length < 5)) {
-                                nodesToHide.push(el);
-                                break;
-                            }
-                            el = el.parentElement;
-                        }
-                    }
-                }
-                nodesToHide.forEach(el => {
-                    // Hide the element and its parent row
-                    el.style.display = 'none';
-                    if (el.parentElement && el.parentElement !== article) {
-                        el.parentElement.style.display = 'none';
-                    }
-                });
+            # Use element screenshot for more reliable capture
+            article_element = page.query_selector('article')
+            if article_element:
+                # Scroll article into view
+                article_element.scroll_into_view_if_needed()
+                page.wait_for_timeout(300)
 
-                // Also try direct approach - hide divs containing reply text after action bar
-                const groups = article.querySelectorAll('[role="group"]');
-                if (groups.length > 0) {
-                    const lastGroup = groups[groups.length - 1];  // Action bar (like/retweet)
-                    let sibling = lastGroup.parentElement?.nextElementSibling;
-                    while (sibling) {
-                        sibling.style.display = 'none';
-                        sibling = sibling.nextElementSibling;
-                    }
-                }
-            }
-        }''')
+                # Take screenshot of just the article element
+                logger.info("Taking article element screenshot")
+                article_element.screenshot(path=screenshot_path)
+            elif clip and clip.get('height', 0) > 50:
+                logger.info(f"Fallback to clip bounds: {clip}")
+                page.screenshot(path=screenshot_path, clip=clip)
+            else:
+                # Fallback to full viewport
+                page.screenshot(path=screenshot_path, full_page=False)
 
-        await page.wait_for_timeout(500)
+            # Read screenshot bytes
+            with open(screenshot_path, 'rb') as f:
+                screenshot_bytes = f.read()
+            os.remove(screenshot_path)
 
-        # Wait for quoted tweets / embedded content to load
-        try:
-            # Multiple selectors for quote tweets (Twitter changes these periodically)
-            quote_selectors = [
-                '[data-testid="card.wrapper"]',
-                '[data-testid="tweetText"] + div > a[href*="/status/"]',  # Quote tweet link
-                'article [role="link"][href*="/status/"]',  # Embedded tweet
-                '[data-testid="quoteTweet"]',
-            ]
-            for selector in quote_selectors:
-                try:
-                    await page.wait_for_selector(selector, timeout=2000)
-                    logger.info(f"Found quote element: {selector}")
-                    break
-                except:
-                    continue
-            await page.wait_for_timeout(2000)  # Extra time for quote content
-        except:
-            pass  # No quote tweet
+            # Close browser
+            browser.close()
 
-        # Wait for all images including in quoted tweets
-        await page.evaluate('''() => {
-            return new Promise(resolve => {
-                const images = document.querySelectorAll('article img');
-                let loaded = 0;
-                const total = images.length;
-                if (total === 0) { resolve(); return; }
-                const checkDone = () => { if (++loaded >= total) resolve(); };
-                images.forEach(img => {
-                    if (img.complete) checkDone();
-                    else { img.onload = checkDone; img.onerror = checkDone; }
-                });
-                setTimeout(resolve, 5000);
-            });
-        }''')
-
-        # Screenshot the article element - use full_page option for proper capture
-        article = await page.query_selector('article')
-        if article:
-            # Get the bounding box to check size
-            box = await article.bounding_box()
-            if box:
-                logger.info(f"Article size: {box['width']}x{box['height']}")
-            screenshot_bytes = await article.screenshot()
             logger.info(f"Captured tweet {parsed['tweet_id']}")
-        else:
-            screenshot_bytes = await page.screenshot()
-            logger.warning("Article not found, captured full page")
-
-        # Save storage state
-        await context.storage_state(path=os.path.join(CONFIG_DIR, "storage_state.json"))
-
-        await browser.close()
-        await playwright.stop()
-
-        return {
-            "success": True,
-            "bytes": screenshot_bytes,
-            "username": parsed['username'],
-            "tweet_id": parsed['tweet_id']
-        }
+            return {
+                "success": True,
+                "bytes": screenshot_bytes,
+                "username": parsed['username'],
+                "tweet_id": parsed['tweet_id']
+            }
 
     except Exception as e:
         logger.error(f"Capture error: {e}")
-        if browser:
-            try:
-                await browser.close()
-            except:
-                pass
-        if playwright:
-            try:
-                await playwright.stop()
-            except:
-                pass
+        import traceback
+        traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 
-async def perform_auto_login_playwright(page):
-    """Auto-login using Playwright"""
-    global LAST_LOGIN_ATTEMPT
-
-    creds = load_credentials()
-    if not creds:
-        logger.error("No credentials stored for auto-login")
-        return False
-
-    now = time.time()
-    if now - LAST_LOGIN_ATTEMPT < LOGIN_COOLDOWN:
-        logger.warning(f"Auto-login cooldown active")
-        return False
-
-    LAST_LOGIN_ATTEMPT = now
-    logger.info("Starting auto-login with Playwright...")
-
-    try:
-        # Go to login page
-        await page.goto("https://x.com/login", wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
-
-        # Step 1: Enter username
-        logger.info("Step 1: Entering username...")
-        try:
-            # Try multiple selectors for the username input
-            username_input = None
-            selectors = [
-                'input[autocomplete="username"]',
-                'input[name="text"]',
-                'input[type="text"]',
-                'input'
-            ]
-
-            for sel in selectors:
-                try:
-                    elem = page.locator(sel).first
-                    if await elem.count() > 0:
-                        username_input = elem
-                        logger.info(f"Found input with selector: {sel}")
-                        break
-                except:
-                    continue
-
-            if not username_input:
-                logger.error("Could not find any input field")
-                return False
-
-            # Click to ensure focus
-            await username_input.click()
-            await page.wait_for_timeout(1000)
-
-            # Clear any existing value
-            await username_input.fill("")
-            await page.wait_for_timeout(300)
-
-            # Type username using press_sequentially for reliability
-            await username_input.press_sequentially(creds["username"], delay=100)
-            await page.wait_for_timeout(500)
-
-            # Verify
-            value = await username_input.input_value()
-            logger.info(f"Username field value: '{value}'")
-
-            # Debug: screenshot BEFORE clicking Next
-            try:
-                ss = await page.screenshot()
-                with open("/tmp/twitter_screenshots/login_step1_before.png", "wb") as f:
-                    f.write(ss)
-                logger.info("Saved pre-Next screenshot")
-            except:
-                pass
-
-        except Exception as e:
-            logger.error(f"Could not enter username: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-        await page.wait_for_timeout(1500)
-
-        # Click Next button directly
-        logger.info("Clicking Next button...")
-
-        # Find and click the Next button using Playwright locator
-        next_btn = page.get_by_role("button", name="Next")
-        try:
-            await next_btn.click()
-            logger.info("Clicked Next button")
-        except Exception as e:
-            logger.warning(f"Could not click Next button: {e}")
-            # Fallback: try clicking by text
-            try:
-                next_btn2 = page.locator('div[role="button"]:has-text("Next")')
-                await next_btn2.first.click()
-                logger.info("Clicked Next via role=button")
-            except:
-                # Last resort: press Enter
-                await page.keyboard.press("Enter")
-                logger.info("Pressed Enter as fallback")
-
-        # Screenshot immediately after clicking
-        await page.wait_for_timeout(1000)
-        try:
-            ss = await page.screenshot()
-            with open("/tmp/twitter_screenshots/login_step1_after.png", "wb") as f:
-                f.write(ss)
-            logger.info("Saved post-Next screenshot")
-        except:
-            pass
-
-        await page.wait_for_timeout(5000)
-
-        # Debug: Save screenshot of login state
-        try:
-            debug_ss = await page.screenshot()
-            with open("/tmp/twitter_screenshots/login_debug.png", "wb") as f:
-                f.write(debug_ss)
-            logger.info("Saved login debug screenshot")
-        except:
-            pass
-
-        # Step 2: Check for verification (phone/email/username)
-        page_text = await page.evaluate('document.body.innerText')
-        logger.info(f"After Step 1: {page_text[:150]}")
-
-        # Handle verification challenge
-        if "phone" in page_text.lower() or "email" in page_text.lower() or "username" in page_text.lower():
-            if "password" not in page_text.lower():
-                logger.info("Step 2: Verification challenge detected...")
-                verify_input = page.locator('input[name="text"], input[data-testid="ocfEnterTextTextInput"]')
-                try:
-                    await verify_input.first.wait_for(timeout=5000)
-                    await verify_input.first.fill(creds["username"])
-                    await page.wait_for_timeout(500)
-
-                    next_btn = page.locator('button:has-text("Next"), div[role="button"]:has-text("Next")')
-                    await next_btn.first.click()
-                    await page.wait_for_timeout(5000)
-                    logger.info("Verification completed")
-                except Exception as e:
-                    logger.warning(f"Verification failed: {e}")
-
-        # Step 3: Enter password
-        logger.info("Step 3: Entering password...")
-        password_input = page.locator('input[name="password"], input[type="password"]')
-        try:
-            await password_input.first.wait_for(timeout=10000)
-        except:
-            # Take screenshot for debugging
-            page_text = await page.evaluate('document.body.innerText')
-            logger.error(f"Password field not found. Page: {page_text[:300]}")
-            return False
-
-        await password_input.first.fill(creds["password"])
-        logger.info("Password entered")
-        await page.wait_for_timeout(1000)
-
-        # Click Log in button
-        logger.info("Clicking Log in...")
-        login_btn = page.locator('button:has-text("Log in"), div[role="button"]:has-text("Log in")')
-        try:
-            await login_btn.first.click()
-            logger.info("Clicked Log in")
-        except:
-            await page.keyboard.press("Enter")
-            logger.info("Pressed Enter")
-
-        await page.wait_for_timeout(8000)
-
-        # Check success
-        current_url = page.url
-        logger.info(f"Final URL: {current_url}")
-
-        if "home" in current_url.lower():
-            logger.info("Auto-login successful!")
-            return True
-
-        page_text = await page.evaluate('document.body.innerText')
-        if "Wrong password" in page_text or "incorrect" in page_text.lower():
-            logger.error("Auto-login failed: incorrect password")
-            return False
-
-        if "Something went wrong" in page_text:
-            logger.error("Auto-login failed: Twitter error")
-            return False
-
-        # Check if we can see compose button (logged in indicator)
-        compose = await page.query_selector('[data-testid="SideNav_NewTweet_Button"]')
-        if compose:
-            logger.info("Auto-login successful (found compose button)")
-            return True
-
-        logger.info(f"Login status unclear, URL: {current_url}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Auto-login error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
-
-
 def capture_tweet_sync(url, parsed, theme="dark", hide_metrics=False, width=550):
-    """Synchronous wrapper for async capture"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        result = loop.run_until_complete(
-            capture_tweet_playwright(url, parsed, theme, hide_metrics, width)
-        )
-        return result
-    finally:
-        loop.close()
+    """Synchronous capture function"""
+    return capture_tweet_playwright(url, parsed, theme, hide_metrics, width)
 
 # =============================================================================
 # Queue Worker
@@ -1040,55 +768,13 @@ def auth_clear():
     return jsonify({"success": True})
 
 
-@app.route("/api/credentials", methods=["GET"])
-def credentials_status():
-    """Check if credentials are configured"""
-    creds = load_credentials()
-    if creds:
-        return jsonify({
-            "configured": True,
-            "username": creds.get("username", "")[:3] + "***"  # Masked
-        })
-    return jsonify({"configured": False})
-
-
-@app.route("/api/credentials", methods=["POST"])
-def credentials_save():
-    """Save Twitter credentials for auto-login"""
-    data = request.json
-    if not data:
-        return jsonify({"success": False, "error": "No data provided"}), 400
-
-    username = data.get("username", "").strip()
-    password = data.get("password", "").strip()
-
-    if not username or not password:
-        return jsonify({"success": False, "error": "Username and password required"}), 400
-
-    if save_credentials(username, password):
-        return jsonify({
-            "success": True,
-            "message": "Credentials saved. Auto-login will be attempted when needed."
-        })
-    return jsonify({"success": False, "error": "Failed to save credentials"}), 500
-
-
-@app.route("/api/credentials", methods=["DELETE"])
-def credentials_clear():
-    """Clear stored credentials"""
-    if os.path.exists(CREDENTIALS_FILE):
-        os.remove(CREDENTIALS_FILE)
-        return jsonify({"success": True, "message": "Credentials cleared"})
-    return jsonify({"success": True, "message": "No credentials to clear"})
-
-
 @app.route("/api/capture", methods=["POST"])
 def capture():
     data = request.json
     url = data.get("url", "").strip()
     theme = data.get("theme", "dark")
     hide_metrics = data.get("hide_metrics", False)
-    width = max(300, min(800, int(data.get("width", 550))))
+    width = max(400, min(800, int(data.get("width", 550))))
 
     if not url:
         return jsonify({"success": False, "error": "No URL provided"})
@@ -1116,7 +802,7 @@ def queue_add():
     urls = data.get('urls', [])
     theme = data.get('theme', 'dark')
     hide_metrics = data.get('hide_metrics', False)
-    width = max(300, min(800, int(data.get('width', 550))))
+    width = max(400, min(800, int(data.get('width', 550))))
 
     if not urls:
         return jsonify({'error': 'No URLs provided'}), 400
@@ -1254,6 +940,7 @@ def queue_download_all():
                 prefix = str(idx).zfill(pad_width)
                 name = f"{prefix}_tweet_{username}_{tweet_id}.png"
                 zf.writestr(name, data['bytes'])
+
         zip_buffer.seek(0)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1311,23 +998,23 @@ Usage:
     python twitter_auth.py
 
 Requirements:
-    pip install nodriver
+    pip install playwright
+    playwright install chromium
 """
 
-import asyncio
 import json
 import os
 import sys
 
 try:
-    import nodriver as uc
+    from playwright.sync_api import sync_playwright
 except ImportError:
-    print("ERROR: nodriver not installed")
-    print("Install with: pip install nodriver")
+    print("ERROR: playwright not installed")
+    print("Install with: pip install playwright && playwright install chromium")
     sys.exit(1)
 
 
-async def main():
+def main():
     print("=" * 60)
     print("Twitter Authentication Script")
     print("=" * 60)
@@ -1339,81 +1026,55 @@ async def main():
     print()
     print("Starting browser...")
 
-    user_data_dir = os.path.expanduser("~/.twitter_screenshot_auth")
-    os.makedirs(user_data_dir, exist_ok=True)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
 
-    browser = await uc.start(
-        headless=False,
-        user_data_dir=user_data_dir,
-    )
+        page.goto("https://x.com/login")
 
-    page = await browser.get("https://x.com/login")
+        print()
+        print("Browser opened. Please log into Twitter.")
+        print()
+        input("Press Enter after you've logged in and can see your timeline...")
 
-    print()
-    print("Browser opened. Please log into Twitter.")
-    print()
-    input("Press Enter after you've logged in and can see your timeline...")
+        # Get storage state (cookies + localStorage)
+        storage = context.storage_state()
 
-    cookies = await browser.cookies.get_all()
-
-    cookie_list = []
-    for cookie in cookies:
-        cookie_dict = {
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain,
-            "path": cookie.path,
-            "secure": cookie.secure,
-            "httpOnly": cookie.http_only if hasattr(cookie, 'http_only') else False,
+        auth_data = {
+            "cookies": storage["cookies"],
+            "localStorage": {},
+            "timestamp": __import__("datetime").datetime.now().isoformat(),
         }
-        if hasattr(cookie, 'expires') and cookie.expires:
-            cookie_dict["expires"] = cookie.expires
-        if hasattr(cookie, 'sameSite') and cookie.sameSite:
-            cookie_dict["sameSite"] = cookie.sameSite
-        cookie_list.append(cookie_dict)
 
-    local_storage = {}
-    try:
-        local_storage = await page.evaluate("""() => {
-            const items = {};
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                items[key] = localStorage.getItem(key);
-            }
-            return items;
-        }""")
-    except:
-        pass
+        # Extract localStorage
+        for origin in storage.get("origins", []):
+            if "x.com" in origin.get("origin", ""):
+                for item in origin.get("localStorage", []):
+                    auth_data["localStorage"][item["name"]] = item["value"]
 
-    auth_data = {
-        "cookies": cookie_list,
-        "localStorage": local_storage,
-        "userDataDir": user_data_dir,
-        "timestamp": __import__("datetime").datetime.now().isoformat(),
-    }
+        browser.close()
 
-    await browser.stop()
+        print()
+        print("=" * 60)
+        print("SUCCESS! Copy the JSON below and paste it into the web app:")
+        print("=" * 60)
+        print()
+        print(json.dumps(auth_data, indent=2))
+        print()
+        print("=" * 60)
 
-    print()
-    print("=" * 60)
-    print("SUCCESS! Copy the JSON below and paste it into the web app:")
-    print("=" * 60)
-    print()
-    print(json.dumps(auth_data, indent=2))
-    print()
-    print("=" * 60)
+        auth_file = os.path.expanduser("~/.twitter_screenshot_auth.json")
+        with open(auth_file, "w") as f:
+            json.dump(auth_data, f, indent=2)
+        print(f"Also saved to: {auth_file}")
+        print()
 
-    auth_file = os.path.expanduser("~/.twitter_screenshot_auth.json")
-    with open(auth_file, "w") as f:
-        json.dump(auth_data, f, indent=2)
-    print(f"Also saved to: {auth_file}")
-    print()
-
-    return auth_data
+        return auth_data
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
 '''
     response = make_response(auth_script)
     response.headers["Content-Type"] = "text/plain; charset=utf-8"
@@ -1427,7 +1088,7 @@ if __name__ == "__main__":
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Twitter Screenshot App - Authenticated Direct Capture")
+    print("Twitter Screenshot App - Playwright Edition")
     print("=" * 60)
 
     display = os.environ.get('DISPLAY')

@@ -123,7 +123,7 @@
                 </div>
                 <div class="options-row" style="margin-top:0">
                     <div class="checkbox-wrapper"><input type="checkbox" id="hideMetrics"><label for="hideMetrics">Hide metrics</label></div>
-                    <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="300" max="800" value="550"><span class="value" id="widthValue">550px</span></div>
+                    <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="400" max="800" value="550"><span class="value" id="widthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn active" onclick="setTheme(0)">Dark</button><button class="theme-btn" onclick="setTheme(1)">Light</button></div>
                 </div>
                 <div id="status" class="status"></div>
@@ -139,7 +139,7 @@
                 <textarea id="batchUrls" placeholder="Paste tweet URLs (one per line)&#10;&#10;Example:&#10;https://twitter.com/user/status/123&#10;https://x.com/user/status/456"></textarea>
                 <div class="options-row">
                     <div class="checkbox-wrapper"><input type="checkbox" id="batchHideMetrics"><label for="batchHideMetrics">Hide metrics</label></div>
-                    <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="300" max="800" value="550"><span class="value" id="batchWidthValue">550px</span></div>
+                    <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="400" max="800" value="550"><span class="value" id="batchWidthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn batch-theme active" onclick="setBatchTheme(0)">Dark</button><button class="theme-btn batch-theme" onclick="setBatchTheme(1)">Light</button></div>
                 </div>
                 <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="addToQueue()">Add to Queue</button>
@@ -325,7 +325,29 @@ function updateQueueUI(items){
 }
 
 function downloadSingle(id){const a=document.createElement("a");a.href="/api/queue/download/"+id;a.download="";document.body.appendChild(a);a.click();document.body.removeChild(a);}
-function downloadAll(){const a=document.createElement("a");a.href="/api/queue/download-all";a.download="";document.body.appendChild(a);a.click();document.body.removeChild(a);}
+async function downloadAll(){
+    try {
+        const response = await fetch("/api/queue/download-all");
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ error: "Download failed" }));
+            showStatus("batchStatus", "error", error.error || "Download failed");
+            return;
+        }
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
+        a.download = `twitter_screenshots_${timestamp}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+        showStatus("batchStatus", "success", "Download started");
+    } catch (e) {
+        showStatus("batchStatus", "error", `Network error: ${e.message}`);
+    }
+}
 async function clearQueue(){if(confirm("Clear queue?")){await fetch("/api/queue/clear",{method:"POST"});showStatus("batchStatus","success","Cleared");}}
 function showStatus(id,type,msg){const el=document.getElementById(id);el.className="status "+type;el.innerHTML=msg;if(type==="success")setTimeout(()=>el.className="status",3000);}
 

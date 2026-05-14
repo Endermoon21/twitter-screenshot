@@ -1,3 +1,2 @@
-flask
-nodriver
-Pillow
+pywebview>=4.0
+playwright>=1.40.0
