@@ -235,8 +235,12 @@ def broadcast_queue_update():
 # Capture Functions
 # =============================================================================
 
-def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, width=550):
-    """Capture tweet using Playwright with authentication"""
+def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, width=550, include_replies=False, max_replies=5):
+    """Capture tweet using Playwright with authentication
+
+    include_replies: when True, keeps up to max_replies reply articles visible
+    below the main tweet, and screenshots a clip region that covers all of them.
+    """
     try:
         # Load auth data
         auth = load_auth()
@@ -366,7 +370,7 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
             # Remove UI clutter for cleaner screenshot
             # Pass the username from URL to find the correct article
             target_username = parsed['username'].lower()
-            page.evaluate('''(targetUser) => {
+            page.evaluate('''({targetUser, includeReplies, maxReplies}) => {
                 // Hide scrollbars and set consistent background
                 document.documentElement.style.overflow = 'hidden';
                 document.body.style.overflow = 'hidden';
@@ -448,9 +452,27 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
                     targetArticle = articles[0];
                 }
 
+                // If include_replies is on, collect up to maxReplies article
+                // elements that appear AFTER the target in document order.
+                // These are the actual reply tweets in the conversation timeline.
+                const replyArticles = [];
+                if (includeReplies && targetArticle) {
+                    const targetIdx = Array.from(articles).indexOf(targetArticle);
+                    if (targetIdx !== -1) {
+                        for (let i = targetIdx + 1;
+                             i < articles.length && replyArticles.length < maxReplies;
+                             i++) {
+                            replyArticles.push(articles[i]);
+                        }
+                    }
+                }
+                // Stash for the bbox-calc step to pick up later
+                window.__replyArticles = replyArticles;
+                window.__replyCount = replyArticles.length;
+
                 // Hide all other articles (don't remove to avoid React crash)
                 for (const art of articles) {
-                    if (art !== targetArticle) {
+                    if (art !== targetArticle && !replyArticles.includes(art)) {
                         art.style.display = 'none';
                     }
                 }
@@ -473,18 +495,23 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
                         }
                     });
 
-                    // Hide content after the LAST engagement bar (replies section)
-                    const groups = article.querySelectorAll('[role="group"]');
-                    if (groups.length > 0) {
-                        const lastGroup = groups[groups.length - 1];
-                        let next = lastGroup.parentElement?.nextElementSibling;
-                        while (next) {
-                            next.style.display = 'none';
-                            next = next.nextElementSibling;
+                    // Hide content after the LAST engagement bar (the "More replies"
+                    // / "Discover more" sections below the conversation).
+                    // When include_replies is on, skip this — those reply articles
+                    // live in the nextElementSibling chain and we want them shown.
+                    if (!includeReplies) {
+                        const groups = article.querySelectorAll('[role="group"]');
+                        if (groups.length > 0) {
+                            const lastGroup = groups[groups.length - 1];
+                            let next = lastGroup.parentElement?.nextElementSibling;
+                            while (next) {
+                                next.style.display = 'none';
+                                next = next.nextElementSibling;
+                            }
                         }
                     }
                 }
-            }''', target_username)
+            }''', {'targetUser': target_username, 'includeReplies': include_replies, 'maxReplies': max_replies})
 
             page.wait_for_timeout(500)
 
@@ -581,6 +608,27 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
                 }
 
 
+                // When include_replies kept extra articles visible, extend bottomY
+                // to cover the bottommost reply's engagement bar.
+                const replyArticles = window.__replyArticles || [];
+                for (const replyArt of replyArticles) {
+                    const replyRect = replyArt.getBoundingClientRect();
+                    // Engagement bar of each reply
+                    const replyGroups = replyArt.querySelectorAll('[role="group"]');
+                    for (const g of replyGroups) {
+                        if (g.querySelector('[data-testid="like"]') || g.querySelector('[data-testid="reply"]')) {
+                            const gBottom = g.getBoundingClientRect().bottom;
+                            if (gBottom > bottomY) {
+                                bottomY = gBottom;
+                            }
+                        }
+                    }
+                    // Fall back to article rect if no engagement bar found
+                    if (replyRect.bottom > bottomY) {
+                        bottomY = replyRect.bottom;
+                    }
+                }
+
                 // Return clip region with padding
                 const topPadding = 15;
                 const sidePadding = 12;
@@ -600,9 +648,14 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
             screenshot_path = f"/tmp/tweet_{parsed['tweet_id']}_{int(time.time())}.png"
 
 
-            # Use element screenshot for more reliable capture
+            # When include_replies is on, the element screenshot only captures the
+            # single main <article>, so we MUST use the clip-based path that the
+            # bbox-calc step computed (it spans main tweet + visible replies).
             article_element = page.query_selector('article')
-            if article_element:
+            if include_replies and clip and clip.get('height', 0) > 50:
+                logger.info(f"Taking clip screenshot with {max_replies} replies: {clip}")
+                page.screenshot(path=screenshot_path, clip=clip)
+            elif article_element:
                 # Scroll article into view
                 article_element.scroll_into_view_if_needed()
                 page.wait_for_timeout(300)
@@ -640,9 +693,9 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
         return {"success": False, "error": str(e)}
 
 
-def capture_tweet_sync(url, parsed, theme="dark", hide_metrics=False, width=550):
+def capture_tweet_sync(url, parsed, theme="dark", hide_metrics=False, width=550, include_replies=False, max_replies=5):
     """Synchronous capture function"""
-    return capture_tweet_playwright(url, parsed, theme, hide_metrics, width)
+    return capture_tweet_playwright(url, parsed, theme, hide_metrics, width, include_replies, max_replies)
 
 # =============================================================================
 # Queue Worker
@@ -666,7 +719,9 @@ def queue_worker():
                     item['parsed'],
                     theme=item.get('theme', 'dark'),
                     hide_metrics=item.get('hide_metrics', False),
-                    width=item.get('width', 550)
+                    width=item.get('width', 550),
+                    include_replies=item.get('include_replies', False),
+                    max_replies=item.get('max_replies', 5),
                 )
 
                 if result['success']:
@@ -775,6 +830,8 @@ def capture():
     theme = data.get("theme", "dark")
     hide_metrics = data.get("hide_metrics", False)
     width = max(400, min(800, int(data.get("width", 550))))
+    include_replies = bool(data.get("include_replies", False))
+    max_replies = max(1, min(20, int(data.get("max_replies", 5))))
 
     if not url:
         return jsonify({"success": False, "error": "No URL provided"})
@@ -783,7 +840,7 @@ def capture():
     if not parsed:
         return jsonify({"success": False, "error": "Invalid tweet URL"})
 
-    result = capture_tweet_sync(url, parsed, theme, hide_metrics, width)
+    result = capture_tweet_sync(url, parsed, theme, hide_metrics, width, include_replies, max_replies)
 
     if result['success']:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -803,6 +860,8 @@ def queue_add():
     theme = data.get('theme', 'dark')
     hide_metrics = data.get('hide_metrics', False)
     width = max(400, min(800, int(data.get('width', 550))))
+    include_replies = bool(data.get('include_replies', False))
+    max_replies = max(1, min(20, int(data.get('max_replies', 5))))
 
     if not urls:
         return jsonify({'error': 'No URLs provided'}), 400
@@ -831,6 +890,8 @@ def queue_add():
             'theme': theme,
             'hide_metrics': hide_metrics,
             'width': width,
+            'include_replies': include_replies,
+            'max_replies': max_replies,
             'status': QueueStatus.PENDING,
             'created_at': datetime.now().isoformat(),
         }

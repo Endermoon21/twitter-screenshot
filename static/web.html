@@ -123,6 +123,8 @@
                 </div>
                 <div class="options-row" style="margin-top:0">
                     <div class="checkbox-wrapper"><input type="checkbox" id="hideMetrics"><label for="hideMetrics">Hide metrics</label></div>
+                    <div class="checkbox-wrapper"><input type="checkbox" id="includeReplies" onchange="document.getElementById('maxRepliesGroup').style.display=this.checked?'flex':'none'"><label for="includeReplies">Include replies</label></div>
+                    <div class="slider-group" id="maxRepliesGroup" style="display:none"><label>Max:</label><input type="number" id="maxReplies" min="1" max="20" value="5" style="width:48px"></div>
                     <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="400" max="800" value="550"><span class="value" id="widthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn active" onclick="setTheme(0)">Dark</button><button class="theme-btn" onclick="setTheme(1)">Light</button></div>
                 </div>
@@ -139,6 +141,8 @@
                 <textarea id="batchUrls" placeholder="Paste tweet URLs (one per line)&#10;&#10;Example:&#10;https://twitter.com/user/status/123&#10;https://x.com/user/status/456"></textarea>
                 <div class="options-row">
                     <div class="checkbox-wrapper"><input type="checkbox" id="batchHideMetrics"><label for="batchHideMetrics">Hide metrics</label></div>
+                    <div class="checkbox-wrapper"><input type="checkbox" id="batchIncludeReplies" onchange="document.getElementById('batchMaxRepliesGroup').style.display=this.checked?'flex':'none'"><label for="batchIncludeReplies">Include replies</label></div>
+                    <div class="slider-group" id="batchMaxRepliesGroup" style="display:none"><label>Max:</label><input type="number" id="batchMaxReplies" min="1" max="20" value="5" style="width:48px"></div>
                     <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="400" max="800" value="550"><span class="value" id="batchWidthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn batch-theme active" onclick="setBatchTheme(0)">Dark</button><button class="theme-btn batch-theme" onclick="setBatchTheme(1)">Light</button></div>
                 </div>
@@ -291,7 +295,7 @@ async function captureTweet(){
     btn.disabled=true;btn.innerHTML="<span class=\"spinner\"></span>";showStatus("status","loading","<span class=\"spinner\"></span> Capturing...");actions.classList.remove("visible");
     preview.innerHTML="<div style=\"color:#8899a6\"><div class=\"spinner\" style=\"width:40px;height:40px;border-width:3px\"></div></div>";
     try{
-        const res=await fetch("/api/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,theme,hide_metrics:document.getElementById("hideMetrics").checked,width})});
+        const res=await fetch("/api/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,theme,hide_metrics:document.getElementById("hideMetrics").checked,width,include_replies:document.getElementById("includeReplies").checked,max_replies:+document.getElementById("maxReplies").value})});
         const data=await res.json();
         if(data.success){showStatus("status","success","Captured!");filename=data.filename;imageUrl="/screenshots/"+data.filename;preview.innerHTML="<div class=\"result show\"><img src=\""+imageUrl+"\"></div>";actions.classList.add("visible");}
         else{showStatus("status","error",data.error||"Failed");preview.innerHTML="<p class=\"placeholder\">Failed</p>";}
@@ -307,7 +311,7 @@ async function addToQueue(){
     if(!urls.length){showStatus("batchStatus","error","Enter at least one URL");return;}
     if(urls.length>50){showStatus("batchStatus","error","Max 50 URLs");return;}
     try{
-        const res=await fetch("/api/queue/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,theme:batchTheme,hide_metrics:document.getElementById("batchHideMetrics").checked,width:batchWidth})});
+        const res=await fetch("/api/queue/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,theme:batchTheme,hide_metrics:document.getElementById("batchHideMetrics").checked,width:batchWidth,include_replies:document.getElementById("batchIncludeReplies").checked,max_replies:+document.getElementById("batchMaxReplies").value})});
         const data=await res.json();
         if(data.added&&data.added.length){showStatus("batchStatus","success","Added "+data.added.length+" URLs");document.getElementById("batchUrls").value="";}
         if(data.errors&&data.errors.length)showStatus("batchStatus","error",data.errors.length+" failed");
