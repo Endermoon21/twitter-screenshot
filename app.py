@@ -235,12 +235,19 @@ def broadcast_queue_update():
 # Capture Functions
 # =============================================================================
 
-def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, width=550, include_replies=False, max_replies=5):
+def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, width=550, include_replies=False, max_replies=5, reply_tweet_ids=None):
     """Capture tweet using Playwright with authentication
 
     include_replies: when True, keeps up to max_replies reply articles visible
     below the main tweet, and screenshots a clip region that covers all of them.
+
+    reply_tweet_ids: optional list of specific reply tweet IDs (strings) to keep.
+    When provided AND include_replies is True, only articles matching one of
+    these IDs are kept (still capped at max_replies as a safety limit).
+    When None or empty, the default "top N" behavior applies.
     """
+    if reply_tweet_ids is None:
+        reply_tweet_ids = []
     try:
         # Load auth data
         auth = load_auth()
@@ -370,7 +377,7 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
             # Remove UI clutter for cleaner screenshot
             # Pass the username from URL to find the correct article
             target_username = parsed['username'].lower()
-            page.evaluate('''({targetUser, includeReplies, maxReplies}) => {
+            page.evaluate('''({targetUser, includeReplies, maxReplies, replyTweetIds}) => {
                 // Hide scrollbars and set consistent background
                 document.documentElement.style.overflow = 'hidden';
                 document.body.style.overflow = 'hidden';
@@ -454,15 +461,33 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
 
                 // If include_replies is on, collect up to maxReplies article
                 // elements that appear AFTER the target in document order.
-                // These are the actual reply tweets in the conversation timeline.
+                // If replyTweetIds is non-empty, only keep articles whose
+                // permalink tweet ID is in that list (selective mode).
                 const replyArticles = [];
+                const selectiveSet = new Set(replyTweetIds || []);
+                const isSelective = selectiveSet.size > 0;
+                const extractTweetId = (art) => {
+                    const links = art.querySelectorAll('a[href*="/status/"]');
+                    for (const a of links) {
+                        const m = a.getAttribute('href').match(/\/status\/(\d+)/);
+                        if (m) return m[1];
+                    }
+                    return null;
+                };
                 if (includeReplies && targetArticle) {
                     const targetIdx = Array.from(articles).indexOf(targetArticle);
                     if (targetIdx !== -1) {
                         for (let i = targetIdx + 1;
                              i < articles.length && replyArticles.length < maxReplies;
                              i++) {
-                            replyArticles.push(articles[i]);
+                            if (isSelective) {
+                                const tid = extractTweetId(articles[i]);
+                                if (tid && selectiveSet.has(tid)) {
+                                    replyArticles.push(articles[i]);
+                                }
+                            } else {
+                                replyArticles.push(articles[i]);
+                            }
                         }
                     }
                 }
@@ -511,7 +536,7 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
                         }
                     }
                 }
-            }''', {'targetUser': target_username, 'includeReplies': include_replies, 'maxReplies': max_replies})
+            }''', {'targetUser': target_username, 'includeReplies': include_replies, 'maxReplies': max_replies, 'replyTweetIds': reply_tweet_ids})
 
             page.wait_for_timeout(500)
 
@@ -648,26 +673,24 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
             screenshot_path = f"/tmp/tweet_{parsed['tweet_id']}_{int(time.time())}.png"
 
 
-            # When include_replies is on, the element screenshot only captures the
-            # single main <article>, so we MUST use the clip-based path that the
-            # bbox-calc step computed (it spans main tweet + visible replies).
+            # ALWAYS prefer the clip path. It's avatar-aware (the bbox-calc step
+            # explicitly extends topY to include the profile picture) and it
+            # correctly spans main tweet + visible replies when include_replies
+            # is on. The element-screenshot path crops the avatar because Twitter
+            # positions it outside the <article> rect on some tweets.
             article_element = page.query_selector('article')
-            if include_replies and clip and clip.get('height', 0) > 50:
-                logger.info(f"Taking clip screenshot with {max_replies} replies: {clip}")
+            if clip and clip.get('height', 0) > 50:
+                logger.info(f"Taking clip screenshot (replies={int(include_replies)}, max={max_replies}): {clip}")
                 page.screenshot(path=screenshot_path, clip=clip)
             elif article_element:
-                # Scroll article into view
+                # Fallback only if clip somehow failed (no article rect)
                 article_element.scroll_into_view_if_needed()
                 page.wait_for_timeout(300)
-
-                # Take screenshot of just the article element
-                logger.info("Taking article element screenshot")
+                logger.info("Fallback to element screenshot (clip unavailable)")
                 article_element.screenshot(path=screenshot_path)
-            elif clip and clip.get('height', 0) > 50:
-                logger.info(f"Fallback to clip bounds: {clip}")
-                page.screenshot(path=screenshot_path, clip=clip)
             else:
-                # Fallback to full viewport
+                # Last resort: full viewport
+                logger.info("Last-resort: full-viewport screenshot")
                 page.screenshot(path=screenshot_path, full_page=False)
 
             # Read screenshot bytes
@@ -693,9 +716,46 @@ def capture_tweet_playwright(url, parsed, theme="dark", hide_metrics=False, widt
         return {"success": False, "error": str(e)}
 
 
-def capture_tweet_sync(url, parsed, theme="dark", hide_metrics=False, width=550, include_replies=False, max_replies=5):
+def capture_tweet_sync(url, parsed, theme="dark", hide_metrics=False, width=550, include_replies=False, max_replies=5, reply_tweet_ids=None):
     """Synchronous capture function"""
-    return capture_tweet_playwright(url, parsed, theme, hide_metrics, width, include_replies, max_replies)
+    return capture_tweet_playwright(url, parsed, theme, hide_metrics, width, include_replies, max_replies, reply_tweet_ids)
+
+
+# Pattern: extract a tweet ID from a URL like
+# https://x.com/user/status/12345 or twitter.com/i/status/12345?s=20
+_TWEET_ID_RE = re.compile(r'/status/(\d+)')
+
+
+def parse_reply_ids(raw):
+    """Coerce a list of URLs or bare IDs into a list of tweet-ID strings.
+
+    Accepts: full x.com/twitter.com URLs, bare numeric IDs, mixed list, etc.
+    Skips anything we can't parse so a typo doesn't tank the whole capture.
+    """
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        # Allow newline / comma-separated string from a textarea
+        raw = re.split(r'[\s,]+', raw.strip())
+    out = []
+    seen = set()
+    for item in raw:
+        if not item:
+            continue
+        s = str(item).strip()
+        if not s:
+            continue
+        m = _TWEET_ID_RE.search(s)
+        if m:
+            tid = m.group(1)
+        elif s.isdigit():
+            tid = s
+        else:
+            continue
+        if tid not in seen:
+            seen.add(tid)
+            out.append(tid)
+    return out
 
 # =============================================================================
 # Queue Worker
@@ -722,6 +782,7 @@ def queue_worker():
                     width=item.get('width', 550),
                     include_replies=item.get('include_replies', False),
                     max_replies=item.get('max_replies', 5),
+                    reply_tweet_ids=item.get('reply_tweet_ids') or [],
                 )
 
                 if result['success']:
@@ -832,6 +893,7 @@ def capture():
     width = max(400, min(800, int(data.get("width", 550))))
     include_replies = bool(data.get("include_replies", False))
     max_replies = max(1, min(20, int(data.get("max_replies", 5))))
+    reply_tweet_ids = parse_reply_ids(data.get("reply_tweet_ids") or data.get("reply_urls"))
 
     if not url:
         return jsonify({"success": False, "error": "No URL provided"})
@@ -840,7 +902,7 @@ def capture():
     if not parsed:
         return jsonify({"success": False, "error": "Invalid tweet URL"})
 
-    result = capture_tweet_sync(url, parsed, theme, hide_metrics, width, include_replies, max_replies)
+    result = capture_tweet_sync(url, parsed, theme, hide_metrics, width, include_replies, max_replies, reply_tweet_ids)
 
     if result['success']:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -862,6 +924,7 @@ def queue_add():
     width = max(400, min(800, int(data.get('width', 550))))
     include_replies = bool(data.get('include_replies', False))
     max_replies = max(1, min(20, int(data.get('max_replies', 5))))
+    reply_tweet_ids = parse_reply_ids(data.get('reply_tweet_ids') or data.get('reply_urls'))
 
     if not urls:
         return jsonify({'error': 'No URLs provided'}), 400
@@ -892,6 +955,7 @@ def queue_add():
             'width': width,
             'include_replies': include_replies,
             'max_replies': max_replies,
+            'reply_tweet_ids': reply_tweet_ids,
             'status': QueueStatus.PENDING,
             'created_at': datetime.now().isoformat(),
         }

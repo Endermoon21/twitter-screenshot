@@ -123,10 +123,13 @@
                 </div>
                 <div class="options-row" style="margin-top:0">
                     <div class="checkbox-wrapper"><input type="checkbox" id="hideMetrics"><label for="hideMetrics">Hide metrics</label></div>
-                    <div class="checkbox-wrapper"><input type="checkbox" id="includeReplies" onchange="document.getElementById('maxRepliesGroup').style.display=this.checked?'flex':'none'"><label for="includeReplies">Include replies</label></div>
-                    <div class="slider-group" id="maxRepliesGroup" style="display:none"><label>Max:</label><input type="number" id="maxReplies" min="1" max="20" value="5" style="width:48px"></div>
+                    <div class="checkbox-wrapper"><input type="checkbox" id="includeReplies" onchange="document.getElementById('replyOpts').style.display=this.checked?'block':'none'"><label for="includeReplies">Include replies</label></div>
                     <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="400" max="800" value="550"><span class="value" id="widthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn active" onclick="setTheme(0)">Dark</button><button class="theme-btn" onclick="setTheme(1)">Light</button></div>
+                </div>
+                <div id="replyOpts" style="display:none;margin-top:8px;padding:10px;border:1px solid #2f3336;border-radius:8px">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><label style="font-size:13px">Max replies:</label><input type="number" id="maxReplies" min="1" max="20" value="5" style="width:60px"><span style="font-size:12px;opacity:0.7">(used when no specific URLs below)</span></div>
+                    <textarea id="replyUrls" placeholder="Or paste specific reply URLs (one per line) to pick exactly which replies show. Leave blank to use top-N." rows="3" style="width:100%;font-size:12px"></textarea>
                 </div>
                 <div id="status" class="status"></div>
             </div>
@@ -146,6 +149,7 @@
                     <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="400" max="800" value="550"><span class="value" id="batchWidthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn batch-theme active" onclick="setBatchTheme(0)">Dark</button><button class="theme-btn batch-theme" onclick="setBatchTheme(1)">Light</button></div>
                 </div>
+                <div style="font-size:11px;opacity:0.6;margin-top:4px">Batch mode uses top-N replies; for picking specific replies, use the Single tab.</div>
                 <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="addToQueue()">Add to Queue</button>
                 <div id="batchStatus" class="status"></div>
             </div>
@@ -295,7 +299,7 @@ async function captureTweet(){
     btn.disabled=true;btn.innerHTML="<span class=\"spinner\"></span>";showStatus("status","loading","<span class=\"spinner\"></span> Capturing...");actions.classList.remove("visible");
     preview.innerHTML="<div style=\"color:#8899a6\"><div class=\"spinner\" style=\"width:40px;height:40px;border-width:3px\"></div></div>";
     try{
-        const res=await fetch("/api/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,theme,hide_metrics:document.getElementById("hideMetrics").checked,width,include_replies:document.getElementById("includeReplies").checked,max_replies:+document.getElementById("maxReplies").value})});
+        const res=await fetch("/api/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url,theme,hide_metrics:document.getElementById("hideMetrics").checked,width,include_replies:document.getElementById("includeReplies").checked,max_replies:+document.getElementById("maxReplies").value,reply_urls:document.getElementById("replyUrls").value})});
         const data=await res.json();
         if(data.success){showStatus("status","success","Captured!");filename=data.filename;imageUrl="/screenshots/"+data.filename;preview.innerHTML="<div class=\"result show\"><img src=\""+imageUrl+"\"></div>";actions.classList.add("visible");}
         else{showStatus("status","error",data.error||"Failed");preview.innerHTML="<p class=\"placeholder\">Failed</p>";}
