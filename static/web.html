@@ -123,8 +123,7 @@
                 </div>
                 <div class="options-row" style="margin-top:0">
                     <div class="checkbox-wrapper"><input type="checkbox" id="hideMetrics"><label for="hideMetrics">Hide metrics</label></div>
-                    <!-- TEMPORARILY DISABLED (reply feature) - remove style="display:none" to re-enable -->
-                    <div class="checkbox-wrapper" style="display:none"><input type="checkbox" id="includeReplies" onchange="document.getElementById('replyOpts').style.display=this.checked?'block':'none'"><label for="includeReplies">Include replies</label></div>
+                    <div class="checkbox-wrapper"><input type="checkbox" id="includeReplies" onchange="document.getElementById('replyOpts').style.display=this.checked?'block':'none'"><label for="includeReplies">Include replies</label></div>
                     <div class="slider-group"><label>Width:</label><input type="range" id="widthSlider" min="400" max="800" value="550"><span class="value" id="widthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn active" onclick="setTheme(0)">Dark</button><button class="theme-btn" onclick="setTheme(1)">Light</button></div>
                 </div>
@@ -145,14 +144,12 @@
                 <textarea id="batchUrls" placeholder="Paste tweet URLs (one per line)&#10;&#10;Example:&#10;https://twitter.com/user/status/123&#10;https://x.com/user/status/456"></textarea>
                 <div class="options-row">
                     <div class="checkbox-wrapper"><input type="checkbox" id="batchHideMetrics"><label for="batchHideMetrics">Hide metrics</label></div>
-                    <!-- TEMPORARILY DISABLED (reply feature) - remove style="display:none" to re-enable -->
-                    <div class="checkbox-wrapper" style="display:none"><input type="checkbox" id="batchIncludeReplies" onchange="document.getElementById('batchMaxRepliesGroup').style.display=this.checked?'flex':'none'"><label for="batchIncludeReplies">Include replies</label></div>
+                    <div class="checkbox-wrapper"><input type="checkbox" id="batchIncludeReplies" onchange="document.getElementById('batchMaxRepliesGroup').style.display=this.checked?'flex':'none'"><label for="batchIncludeReplies">Include replies</label></div>
                     <div class="slider-group" id="batchMaxRepliesGroup" style="display:none"><label>Max:</label><input type="number" id="batchMaxReplies" min="1" max="20" value="5" style="width:48px"></div>
                     <div class="slider-group"><label>Width:</label><input type="range" id="batchWidthSlider" min="400" max="800" value="550"><span class="value" id="batchWidthValue">550px</span></div>
                     <div class="theme-toggle"><button class="theme-btn batch-theme active" onclick="setBatchTheme(0)">Dark</button><button class="theme-btn batch-theme" onclick="setBatchTheme(1)">Light</button></div>
                 </div>
-                <!-- TEMPORARILY DISABLED (reply feature) - remove style="display:none" to re-enable -->
-                <div style="font-size:11px;opacity:0.6;margin-top:4px;display:none">Batch mode uses top-N replies; for picking specific replies, use the Single tab.</div>
+                <div style="font-size:11px;opacity:0.6;margin-top:4px">Batch mode uses top-N replies; for picking specific replies, use the Single tab.</div>
                 <button class="btn btn-primary" style="width:100%;margin-top:16px" onclick="addToQueue()">Add to Queue</button>
                 <div id="batchStatus" class="status"></div>
             </div>
