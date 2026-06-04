@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import queue
+import random
 import re
 import threading
 import time
@@ -822,6 +823,11 @@ def queue_worker():
 
             broadcast_queue_update()
             work_queue.task_done()
+
+            # INTERIM PACING SAFEGUARD (remove when the Phase-1 scheduler ships):
+            # jittered 30-90s gap between captures so a batch can't burst-flag the
+            # account the way the ~5s clockwork burst flagged account #1.
+            time.sleep(random.uniform(30, 90))
 
         except Exception as e:
             logger.error(f"Queue error: {e}")
